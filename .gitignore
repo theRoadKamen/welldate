@@ -1,0 +1,16 @@
+# Local databases and imported ecommerce reports
+data/*.sqlite3
+data/raw/
+data/*.db
+
+# Runtime and temporary files
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+.env
+.env.*
+
+# Local test artifacts
+/tmp/
+test-results/
