@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DATA_ROOT = ROOT / "data"
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(ROOT / "data"))).expanduser().resolve()
 RAW_ROOT = DATA_ROOT / "raw"
 DB_PATHS = {
     "shengyicanmou": DATA_ROOT / "shengyicanmou.sqlite3",
@@ -24,10 +24,8 @@ DB_PATHS = {
 }
 ACCOUNT_DB = DATA_ROOT / "accounts.sqlite3"
 SESSION_DAYS = 7
-SOFFICE = os.environ.get(
-    "SOFFICE",
-    "/Users/well/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice",
-)
+LOCAL_SOFFICE = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice"
+SOFFICE = os.environ.get("SOFFICE") or shutil.which("soffice") or str(LOCAL_SOFFICE)
 
 # Target metadata is centralized here. Numeric defaults remain unset until the
 # business confirms them; the comparison direction is explicit and never inferred.
@@ -760,5 +758,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8765"))
-    print(f"电商数据工作台已启动：http://127.0.0.1:{port}")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    host = os.environ.get("HOST", "127.0.0.1")
+    print(f"电商数据工作台已启动：http://{host}:{port}")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
