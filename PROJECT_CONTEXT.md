@@ -1,0 +1,67 @@
+# 项目背景
+
+更新日期：2026-10-09（Asia/Shanghai）
+
+## 技术栈与运行方式
+
+- 后端：`app.py`，Python 标准库 `http.server`、`sqlite3`、`csv`。
+- 前端：`static/index.html`，原生 HTML/CSS/JavaScript，无构建步骤。
+- XLS 解析：调用 `soffice` 转换后读取；CSV 尝试 UTF-8、GB18030、UTF-16。
+- 本地启动：`python3 app.py`，默认 `http://127.0.0.1:8765`。
+- 容器部署配置：`Dockerfile` 安装 LibreOffice，默认监听 `0.0.0.0:8080`，数据目录为 `/data`；`railway.json` 配置健康检查 `/api/health`。本文件不代表线上已验证。
+
+## 数据架构
+
+- `data/accounts.sqlite3`：账号/店铺、用户、会话、MTD 自定义目标。
+- `data/shengyicanmou.sqlite3`：生意参谋上传记录及文件级结果 JSON。
+- `data/wujie.sqlite3`：无界上传记录及文件级结果 JSON。
+- `data/workbench.sqlite3`：V2.0 文件、批次、原始行、商品、计划、标准事实和指标版本。
+- `data/raw/{account_id}/{source_type}/{date}/`：新导入原文件；历史目录保持原位。数据库和原始经营数据不纳入 Git。
+
+## 主要模块
+
+- 初始化与迁移：`init_databases()`。
+- 店铺：`list_accounts()`、`create_account()`、`/api/accounts`，前端首页和上传页均可新建/切换店铺。
+- 上传：`/api/import`，支持生意参谋商品日报 XLS、无界商品报表 CSV；兼容 UTF-8 BOM、UTF-8、GB18030/GBK 子集、UTF-16，按账号保存并用 SHA-256 识别完全重复文件。旧无界记录仍可查询，但旧计划报表不能作为新版商品事实导入。
+- 上传记录：`/api/upload-records` 查询，`/api/imports/delete` 删除账号范围内记录及无引用原文件。
+- 看板：`/api/dashboard`，按账号和最多 31 天日期范围读取每个日期最新导入记录。
+- 目标：`TARGET_DEFINITIONS`、`/api/targets`，按账号和月份保存自定义 MTD 目标。
+- 前端：顶部“首页/经营看板/数据上传”导航；首页店铺卡片切换当前店铺。
+
+## 功能状态
+
+### 已实现但本轮未重新验证
+
+- 账号登录、店铺创建、两类样本上传、统一查询和旧日期范围看板已在临时 `DATA_ROOT` 端到端验证；店铺切换、上传记录删除和 MTD 目标编辑未在本轮浏览器逐项验证。
+- 转化率代码口径为“成交买家数 / 访客数 × 100%”，兼容成交买家数量、成交买家数、支付买家数字段。
+- 新无界商品报表以 `商品报表` CSV 为当前格式基准，新增解析展现量、点击率、成交笔数、成交人数、购物车数等字段；历史无界记录不迁移。
+- 生意参谋与无界数据按同一账号/店铺合并展示。
+
+### 已验证
+
+- `python3 -m unittest discover -s tests -v`：8 项通过；测试使用脱敏合成无界样本，不提交真实经营报表。
+- 新无界样本：GB18030、79 列、16 行；花费 1415.07、归因成交 3618.99、ROI 2.56。
+- 生意参谋 XLS 样本可解析并持久化，商品 ID 保持字符串。
+- 重复文件、同日冲突、账号隔离、非法编码、科学计数法 ID、混合日期、多计划/多商品关系均有回归测试。
+- 临时服务验证登录、建店、两类上传、`/api/dashboard` 和统一查询接口。
+
+### 尚未验证或尚未完成
+
+- 冲突批次人工确认/替换接口、用户与店铺授权关系、备份恢复、真实浏览器交互回归。
+- 正式周报、官方周期去重访客/成交买家、归因窗口用户选择和完整指标字典管理界面。
+- Railway 持久卷、线上导入、线上重启恢复和 LibreOffice 云端实际可用性。
+
+## V2.0 统一数据底座（2026-10-09）
+
+- 新增 `data/workbench.sqlite3`，不替换现有 `shengyicanmou.sqlite3`、`wujie.sqlite3`。
+- 统一底座包含 `source_files`、`import_batches`、`import_errors`、`raw_rows`、`products`、`plans`、`daily_product_facts`、`daily_plan_product_facts`、`metric_definitions`。
+- 无界新版样本已验证为 GB18030、79 列、16 行、业务日期 2026-10-08；主体 ID 等同商品 ID。
+- 无界事实粒度是日期、场景、计划、商品的组合，不能只按计划 ID 建唯一键。
+- 新增查询接口：`/api/unified/products`、`plans`、`plan-totals`、`metrics`、`batches`、`linked`；只读取有效批次，冲突批次保留但不参与查询。
+- 当前仍未实现用户确认后的批次替换流程；冲突文件先保留为非有效批次。
+
+## Git 现场
+
+- 分支：`main`，当前 `HEAD` 为 `57c1e40`，与 `origin/main` 对齐。
+- 当前未提交改动：`app.py`、`static/index.html`；内容涉及转化率、首页店铺选择/新建、上传删除及新无界商品报表解析/展示。
+- 本次文档任务不得替用户提交这些业务代码，也不得推送或部署。

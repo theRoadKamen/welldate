@@ -9,6 +9,8 @@ import sqlite3
 import shutil
 import subprocess
 import tempfile
+import math
+from contextlib import nullcontext
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +24,7 @@ DB_PATHS = {
     "shengyicanmou": DATA_ROOT / "shengyicanmou.sqlite3",
     "wujie": DATA_ROOT / "wujie.sqlite3",
 }
+UNIFIED_DB = DATA_ROOT / "workbench.sqlite3"
 ACCOUNT_DB = DATA_ROOT / "accounts.sqlite3"
 SESSION_DAYS = 7
 LOCAL_SOFFICE = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/bin/override/soffice"
@@ -36,7 +39,7 @@ TARGET_DEFINITIONS = {
     "conversion_rate": {"label": "转化率", "unit": "percent", "compare_type": "higher", "default_value": None, "mtd_kind": "ratio"},
     "average_order_value": {"label": "客单价", "unit": "amount", "compare_type": "higher", "default_value": None, "mtd_kind": "ratio"},
     "paid_units": {"label": "支付件数", "unit": "number", "compare_type": "higher", "default_value": None, "mtd_kind": "cumulative"},
-    "paid_buyers": {"label": "支付买家数", "unit": "number", "compare_type": "higher", "default_value": None, "mtd_kind": "dedupe"},
+    "paid_buyers": {"label": "成交买家数", "unit": "number", "compare_type": "higher", "default_value": None, "mtd_kind": "dedupe"},
     "spend": {"label": "推广花费", "unit": "amount", "compare_type": "budget", "default_value": None, "mtd_kind": "cumulative"},
     "clicks": {"label": "推广点击量", "unit": "number", "compare_type": "higher", "default_value": None, "mtd_kind": "cumulative"},
     "ppc": {"label": "推广点击单价", "unit": "amount", "compare_type": "lower", "default_value": None, "mtd_kind": "ratio"},
@@ -46,7 +49,7 @@ TARGET_DEFINITIONS = {
 
 
 def source_label(source_type):
-    return "生意参谋商品日报" if source_type == "shengyicanmou" else "无界计划报表"
+    return "生意参谋商品日报" if source_type == "shengyicanmou" else "无界商品报表"
 
 
 def migrate_import_uniqueness(conn):
@@ -73,15 +76,16 @@ def migrate_import_uniqueness(conn):
                 result_json TEXT NOT NULL,
                 imported_at TEXT NOT NULL,
                 account_id INTEGER,
+                import_status TEXT NOT NULL DEFAULT 'succeeded',
                 UNIQUE(account_id, file_sha256)
             )"""
         )
         conn.execute(
             """INSERT INTO imports
                 (id, batch_id, store_name, source_type, business_date, original_filename,
-                 file_path, file_sha256, row_count, result_json, imported_at, account_id)
+                 file_path, file_sha256, row_count, result_json, imported_at, account_id, import_status)
                SELECT id, batch_id, store_name, source_type, business_date, original_filename,
-                      file_path, file_sha256, row_count, result_json, imported_at, account_id
+                      file_path, file_sha256, row_count, result_json, imported_at, account_id, import_status
                  FROM imports_legacy"""
         )
         conn.execute("DROP TABLE imports_legacy")
@@ -106,6 +110,144 @@ def init_databases():
             updated_at TEXT NOT NULL,
             UNIQUE(account_id, month, metric_id)
         )""")
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS source_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                encoding TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(account_id, sha256)
+            );
+            CREATE TABLE IF NOT EXISTS import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                source_file_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                business_date_start TEXT,
+                business_date_end TEXT,
+                report_grain TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                calculation_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                is_effective INTEGER NOT NULL DEFAULT 0,
+                row_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                imported_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_batches_scope ON import_batches(account_id, source_type, business_date_start);
+            CREATE TABLE IF NOT EXISTS import_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                row_number INTEGER,
+                field_name TEXT,
+                raw_value TEXT,
+                error_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS raw_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                row_number INTEGER NOT NULL,
+                business_date TEXT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                raw_payload TEXT NOT NULL,
+                row_hash TEXT NOT NULL,
+                UNIQUE(batch_id, row_number)
+            );
+            CREATE TABLE IF NOT EXISTS products (
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                product_name TEXT,
+                first_seen_date TEXT,
+                last_seen_date TEXT,
+                PRIMARY KEY(account_id, product_id)
+            );
+            CREATE TABLE IF NOT EXISTS plans (
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                plan_name TEXT,
+                scene_id TEXT,
+                scene_name TEXT,
+                first_seen_date TEXT,
+                last_seen_date TEXT,
+                PRIMARY KEY(account_id, plan_id, scene_id)
+            );
+            CREATE TABLE IF NOT EXISTS daily_product_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                business_date TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                batch_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                visitors REAL,
+                paid_buyers REAL,
+                paid_units REAL,
+                gmv REAL,
+                successful_refund_amount REAL,
+                raw_conversion_rate REAL,
+                quality_status TEXT NOT NULL DEFAULT 'valid',
+                UNIQUE(account_id, business_date, product_id, batch_id)
+            );
+            CREATE TABLE IF NOT EXISTS daily_plan_product_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                store_id TEXT NOT NULL,
+                business_date TEXT NOT NULL,
+                scene_id TEXT NOT NULL,
+                scene_name TEXT,
+                plan_id TEXT NOT NULL,
+                plan_name TEXT,
+                product_id TEXT NOT NULL,
+                batch_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                impressions REAL,
+                clicks REAL,
+                spend REAL,
+                direct_deal_amount REAL,
+                indirect_deal_amount REAL,
+                total_deal_amount REAL,
+                direct_deal_orders REAL,
+                indirect_deal_orders REAL,
+                total_deal_orders REAL,
+                deal_people REAL,
+                total_cart_count REAL,
+                raw_roi REAL,
+                quality_status TEXT NOT NULL DEFAULT 'valid',
+                UNIQUE(account_id, business_date, scene_id, plan_id, product_id, batch_id)
+            );
+            CREATE TABLE IF NOT EXISTS metric_definitions (
+                metric_code TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                formula TEXT NOT NULL,
+                aggregation TEXT NOT NULL,
+                version TEXT NOT NULL
+            );
+        """)
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(import_batches)')}
+        for name, definition in [('attribution_window', "TEXT NOT NULL DEFAULT 'unknown'"), ('headers_json', "TEXT NOT NULL DEFAULT '[]'")]:
+            if name not in columns:
+                conn.execute(f'ALTER TABLE import_batches ADD COLUMN {name} {definition}')
+        metric_rows = [
+            ("gmv", "GMV", "SUM(支付金额)", "sum", "v2.0"),
+            ("refund_rate", "退款率", "SUM(成功退款金额)/SUM(支付金额)", "ratio", "v2.0"),
+            ("roi", "投入产出比", "SUM(总成交金额)/SUM(花费)", "ratio", "v2.0"),
+            ("conversion_rate", "转化率", "SUM(成交买家数)/SUM(商品访客数)", "ratio", "v2.0"),
+        ]
+        conn.executemany("INSERT OR IGNORE INTO metric_definitions(metric_code,label,formula,aggregation,version) VALUES (?,?,?,?,?)", metric_rows)
     for path in DB_PATHS.values():
         with sqlite3.connect(path) as conn:
             conn.execute(
@@ -126,6 +268,8 @@ def init_databases():
             columns = {row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()}
             if "account_id" not in columns:
                 conn.execute("ALTER TABLE imports ADD COLUMN account_id INTEGER")
+            if "import_status" not in columns:
+                conn.execute("ALTER TABLE imports ADD COLUMN import_status TEXT NOT NULL DEFAULT 'succeeded'")
             migrate_import_uniqueness(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_store_date ON imports(store_name, business_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_account_date ON imports(account_id, business_date)")
@@ -190,17 +334,32 @@ def aggregate_results(results):
     gmv = total(shop, "gmv")
     refunds = total(shop, "successful_refund_amount")
     units = float(total(shop, "paid_units"))
+    buyers = float(total(shop, "paid_buyers"))
+    visitors = float(total(shop, "visitors"))
     spend = total(ads, "spend")
     deals = total(ads, "total_deal_amount")
     clicks = float(total(ads, "clicks"))
+    impressions = float(total(ads, "impressions"))
+    deal_orders = float(total(ads, "total_deal_orders"))
+    deal_people = float(total(ads, "deal_people"))
+    total_cart = float(total(ads, "total_cart_count"))
     return {
         "gmv": round(gmv, 2), "gsv": round(gmv - refunds, 2), "successful_refund_amount": round(refunds, 2),
         "paid_units": int(units) if units.is_integer() else units, "spend": round(spend, 2),
         "total_deal_amount": round(deals, 2), "clicks": int(clicks) if clicks.is_integer() else clicks,
-        "paid_buyers": None, "visitors": None,
+        "impressions": int(impressions) if impressions.is_integer() else impressions,
+        "total_deal_orders": int(deal_orders) if deal_orders.is_integer() else deal_orders,
+        "deal_people": int(deal_people) if deal_people.is_integer() else deal_people,
+        "total_cart_count": int(total_cart) if total_cart.is_integer() else total_cart,
+        "paid_buyers": int(buyers) if buyers.is_integer() else buyers,
+        "visitors": int(visitors) if visitors.is_integer() else visitors,
         "refund_rate": round(refunds / gmv, 8) if gmv else None,
-        "conversion_rate": None, "average_order_value": round(gmv / units, 2) if units else None,
-        "ppc": round(spend / clicks, 2) if clicks else None, "roi": round(deals / spend, 2) if spend else None,
+        "conversion_rate": round(buyers / visitors, 8) if visitors else None,
+        "average_order_value": round(gmv / units, 2) if units else None,
+        "ppc": round(spend / clicks, 2) if clicks else None,
+        "click_rate": round(clicks / impressions, 8) if impressions else None,
+        "click_conversion_rate": round(deal_orders / clicks, 8) if clicks else None,
+        "roi": round(deals / spend, 2) if spend else None,
         "fee_ratio": round(spend / gmv, 8) if gmv else None,
         "total_days": len({f.get("date") for f in results if f.get("date")}),
     }
@@ -223,30 +382,186 @@ def target_status(value, target, compare_type, complete=True):
     return {"state": "good" if ok else "bad", "difference": round(difference, 4), "progress": round(progress, 4) if progress is not None else None, "text": text}
 
 
-def save_import(source_type, account_id, store_name, batch_id, filename, content, result):
+def persist_unified_import(source_type, account_id, store_name, batch_id, filename, content, result, encoding=None):
+    """Append a normalized, auditable copy without changing legacy source DBs."""
     digest = hashlib.sha256(content).hexdigest()
-    date = result.get("date") or "unknown"
-    raw_dir = RAW_ROOT / source_type / date
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = raw_dir / f"{digest[:16]}-{Path(filename).name}"
-    raw_path.write_bytes(content)
+    records = result.get("records") or []
+    dates = sorted({str(row.get("统计日期") or row.get("日期") or "").strip() for row in records if str(row.get("统计日期") or row.get("日期") or "").strip()})
+    business_date = dates[0] if dates else result.get("date") or "unknown"
+    store_id = f"account:{account_id}"
+    imported_at = datetime.now().isoformat(timespec="seconds")
+    with nullcontext(result['_connection']) if '_connection' in result else sqlite3.connect(UNIFIED_DB) as conn:
+        source = conn.execute(
+            "SELECT id FROM source_files WHERE account_id = ? AND sha256 = ?", (account_id, digest)
+        ).fetchone()
+        if source:
+            return {"status": "duplicate", "batch_db_id": None}
+        cur = conn.execute(
+            "INSERT INTO source_files(account_id,store_id,source_type,original_name,storage_path,sha256,file_size,encoding,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (account_id, store_id, source_type, Path(filename).name, str(RAW_ROOT / str(account_id) / source_type / business_date / f"{digest}-{Path(filename).name}"), digest, len(content), encoding, imported_at),
+        )
+        source_file_id = cur.lastrowid
+        conflict = conn.execute(
+            "SELECT 1 FROM import_batches WHERE account_id = ? AND source_type = ? AND business_date_start = ? AND status IN ('succeeded','conflict') LIMIT 1",
+            (account_id, source_type, business_date),
+        ).fetchone()
+        conflict = conflict or result.get('_legacy_conflict')
+        status = "conflict" if conflict else "succeeded"
+        cur = conn.execute(
+            "INSERT INTO import_batches(batch_id,account_id,store_id,source_file_id,source_type,business_date_start,business_date_end,report_grain,schema_version,calculation_version,status,is_effective,row_count,error_count,imported_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (batch_id, account_id, store_id, source_file_id, source_type, business_date, dates[-1] if dates else business_date, "daily", result.get("schema_version", "unknown"), "v2.0", status, 0 if conflict else 1, len(records), 0, imported_at),
+        )
+        batch_db_id = cur.lastrowid
+        conn.execute('UPDATE import_batches SET attribution_window=?, headers_json=? WHERE id=?', (result.get('attribution_window') or 'unknown', json.dumps(result.get('headers', []), ensure_ascii=False), batch_db_id))
+        error_count = 0
+        for row_number, row in zip(result.get('row_numbers', range(2, len(records) + 2)), records):
+            date = str(row.get("统计日期") or row.get("日期") or "").strip() or None
+            def number(field):
+                nonlocal error_count
+                try:
+                    value = nullable_number(row.get(field))
+                    if value is None:
+                        raise ValueError('missing value')
+                    return value
+                except (TypeError, ValueError):
+                    error_count += 1
+                    conn.execute("INSERT INTO import_errors(batch_id,row_number,field_name,raw_value,error_type,message,created_at) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, field, str(row.get(field) or ""), "invalid_number", f"{field} 不是有效数字", imported_at))
+                    return None
+            if source_type == "shengyicanmou":
+                entity_type, entity_id = "product", str(row.get("商品ID") or "").strip() or None
+                conn.execute("INSERT INTO raw_rows(batch_id,row_number,business_date,entity_type,entity_id,raw_payload,row_hash) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, date, entity_type, entity_id, json.dumps(row, ensure_ascii=False), hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()))
+                if not entity_id:
+                    error_count += 1
+                    conn.execute("INSERT INTO import_errors(batch_id,row_number,field_name,raw_value,error_type,message,created_at) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, "商品ID", "", "missing_identifier", "商品ID不能为空", imported_at))
+                if entity_id:
+                    name = str(row.get("商品名称") or "").strip()
+                    conn.execute("INSERT INTO products(account_id,store_id,product_id,product_name,first_seen_date,last_seen_date) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id,product_id) DO UPDATE SET product_name=excluded.product_name,last_seen_date=excluded.last_seen_date", (account_id, store_id, entity_id, name, date, date))
+                    buyer_field = next(name for name in ('成交买家数量', '成交买家数', '支付买家数') if name in row)
+                    conn.execute("INSERT INTO daily_product_facts(account_id,store_id,business_date,product_id,batch_id,source_type,visitors,paid_buyers,paid_units,gmv,successful_refund_amount,raw_conversion_rate,quality_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (account_id, store_id, date, entity_id, batch_db_id, source_type, number("商品访客数"), number(buyer_field), number("支付件数"), number("支付金额"), number("成功退款金额"), nullable_number(row.get("商品支付转化率")), "valid"))
+            else:
+                entity_type, entity_id = "plan_product", str(row.get("主体ID") or "").strip() or None
+                conn.execute("INSERT INTO raw_rows(batch_id,row_number,business_date,entity_type,entity_id,raw_payload,row_hash) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, date, entity_type, entity_id, json.dumps(row, ensure_ascii=False), hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()))
+                product_id = str(row.get("主体ID") or "").strip()
+                plan_id = str(row.get("计划ID") or "").strip()
+                scene_id = str(row.get("场景ID") or "").strip()
+                if not product_id or not plan_id or not scene_id:
+                    error_count += 1
+                    missing = "、".join(name for name, value in (("主体ID", product_id), ("计划ID", plan_id), ("场景ID", scene_id)) if not value)
+                    conn.execute("INSERT INTO import_errors(batch_id,row_number,field_name,raw_value,error_type,message,created_at) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, missing, "", "missing_identifier", f"{missing}不能为空", imported_at))
+                    continue
+                conn.execute("INSERT INTO products(account_id,store_id,product_id,product_name,first_seen_date,last_seen_date) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id,product_id) DO UPDATE SET product_name=excluded.product_name,last_seen_date=excluded.last_seen_date", (account_id, store_id, product_id, str(row.get("主体名称") or "").strip(), date, date))
+                conn.execute("INSERT INTO plans(account_id,store_id,plan_id,plan_name,scene_id,scene_name,first_seen_date,last_seen_date) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(account_id,plan_id,scene_id) DO UPDATE SET plan_name=excluded.plan_name,scene_name=excluded.scene_name,last_seen_date=excluded.last_seen_date", (account_id, store_id, plan_id, str(row.get("计划名字") or "").strip(), scene_id, str(row.get("场景名字") or "").strip(), date, date))
+                conn.execute("""INSERT INTO daily_plan_product_facts(account_id,store_id,business_date,scene_id,scene_name,plan_id,plan_name,product_id,batch_id,source_type,impressions,clicks,spend,direct_deal_amount,indirect_deal_amount,total_deal_amount,direct_deal_orders,indirect_deal_orders,total_deal_orders,deal_people,total_cart_count,raw_roi,quality_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (account_id, store_id, date, scene_id, str(row.get("场景名字") or "").strip(), plan_id, str(row.get("计划名字") or "").strip(), product_id, batch_db_id, source_type, number("展现量"), number("点击量"), number("花费"), number("直接成交金额"), number("间接成交金额"), number("总成交金额"), number("直接成交笔数"), number("间接成交笔数"), number("总成交笔数"), number("成交人数"), number("总购物车数"), number("投入产出比"), "valid"))
+        if error_count:
+            conn.execute("UPDATE import_batches SET status='partial', is_effective=0, error_count=? WHERE id=?", (error_count, batch_db_id))
+            for table in ('daily_product_facts', 'daily_plan_product_facts'):
+                conn.execute(f"UPDATE {table} SET quality_status='invalid' WHERE batch_id=?", (batch_db_id,))
+            status = "partial"
+    return {"status": status, "batch_db_id": batch_db_id}
+
+
+def save_import(source_type, account_id, store_name, batch_id, filename, content, result, encoding=None):
+    digest = hashlib.sha256(content).hexdigest()
     db_path = DB_PATHS[source_type]
+    with sqlite3.connect(db_path) as conn:
+        if conn.execute("SELECT 1 FROM imports WHERE account_id = ? AND file_sha256 = ?", (account_id, digest)).fetchone():
+            return {"duplicate": True, "sha256": digest, "result": result}
+    date = result.get("date") or "unknown"
+    raw_dir = RAW_ROOT / str(account_id) / source_type / date
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / f"{digest}-{Path(filename).name}"
+    raw_path.write_bytes(content)
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(UNIFIED_DB) as conn:
+            conn.execute('ATTACH DATABASE ? AS legacy', (str(db_path),))
+            conn.execute('BEGIN IMMEDIATE')
+            if conn.execute('SELECT 1 FROM legacy.imports WHERE account_id=? AND file_sha256=?', (account_id, digest)).fetchone():
+                return {"duplicate": True, "sha256": digest, "result": result}
+            legacy_conflict = conn.execute("SELECT 1 FROM legacy.imports WHERE account_id=? AND business_date=? AND import_status='succeeded'", (account_id, date)).fetchone()
+            unified = persist_unified_import(source_type, account_id, store_name, batch_id, filename, content, {**result, '_connection': conn, '_legacy_conflict': bool(legacy_conflict)}, encoding)
+            legacy_result = {key: value for key, value in result.items() if key not in ('records', 'row_numbers')}
+            legacy_result["unified_status"] = unified.get("status")
             conn.execute(
-                "INSERT INTO imports(batch_id, account_id, store_name, source_type, business_date, original_filename, file_path, file_sha256, row_count, result_json, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (batch_id, account_id, store_name, source_type, date, Path(filename).name, str(raw_path), digest, result.get("row_count", 0), json.dumps(result, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")),
+                "INSERT INTO legacy.imports(batch_id, account_id, store_name, source_type, business_date, original_filename, file_path, file_sha256, row_count, result_json, imported_at, import_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, account_id, store_name, source_type, date, Path(filename).name, str(raw_path), digest, result.get("row_count", 0), json.dumps(legacy_result, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"), unified.get("status", "succeeded")),
             )
-    except sqlite3.IntegrityError:
-        return {"duplicate": True, "sha256": digest, "result": result}
-    return {"duplicate": False, "sha256": digest, "result": result}
+    except Exception:
+        raw_path.unlink(missing_ok=True)
+        raise
+    return {"duplicate": False, "sha256": digest, "result": result, "unified_status": unified.get("status")}
+
+
+def query_unified(account_id, start_date, end_date, product_id=None, plan_id=None, scene_id=None):
+    """Read the two grains independently; never join business facts to plan rows."""
+    start = datetime.strptime(start_date, '%Y-%m-%d').date()
+    end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    if end < start or (end - start).days >= 366:
+        raise ValueError('日期范围无效，最多 366 天')
+    result = {}
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        for name, table in [('products', 'daily_product_facts'), ('plans', 'daily_plan_product_facts')]:
+            conditions = ['f.account_id=?', 'f.business_date BETWEEN ? AND ?', 'b.is_effective=1', "b.status='succeeded'"]
+            values = [account_id, start_date, end_date]
+            for field, value in [('product_id', product_id), ('plan_id', plan_id), ('scene_id', scene_id)]:
+                if value is not None and (name == 'plans' or field == 'product_id'):
+                    conditions.append(f'f.{field}=?')
+                    values.append(str(value))
+            result[name] = [dict(r) for r in conn.execute(f"SELECT f.*, b.calculation_version, b.schema_version, b.attribution_window FROM {table} f JOIN import_batches b ON b.id=f.batch_id WHERE {' AND '.join(conditions)} ORDER BY f.business_date, f.id", values)]
+        result['batches'] = [dict(r) for r in conn.execute('SELECT id, batch_id, source_type, status, is_effective, error_count, row_count, business_date_start, schema_version, calculation_version, attribution_window FROM import_batches WHERE account_id=? AND business_date_start BETWEEN ? AND ? ORDER BY id', (account_id, start_date, end_date))]
+    return result
+
+
+def unified_metrics(data):
+    shop, ads = data['products'], data['plans']
+    def total(rows, field):
+        if not rows or any(r.get(field) is None for r in rows):
+            return None
+        return round(sum(r[field] for r in rows), 8)
+    def ratio(numerator, denominator, precision=8):
+        return round(numerator / denominator, precision) if numerator is not None and denominator else None
+    gmv, refunds, units = (total(shop, f) for f in ('gmv', 'successful_refund_amount', 'paid_units'))
+    spend, clicks, impressions = (total(ads, f) for f in ('spend', 'clicks', 'impressions'))
+    # Unknown windows are safe only within one source batch, not across reports.
+    windows = {r['attribution_window'] for r in ads}
+    compatible = len(windows) == 1 and ('unknown' not in windows or len({r['batch_id'] for r in ads}) == 1)
+    deals = total(ads, 'total_deal_amount') if compatible else None
+    people_safe = len(shop) == 1
+    buyers, visitors = (total(shop, f) if people_safe else None for f in ('paid_buyers', 'visitors'))
+    return {
+        'gmv': gmv, 'successful_refund_amount': refunds,
+        'gsv': round(gmv - refunds, 2) if gmv is not None and refunds is not None else None,
+        'paid_units': units, 'paid_buyers': buyers, 'visitors': visitors,
+        'refund_rate': ratio(refunds, gmv), 'average_order_value': ratio(gmv, units, 2),
+        'conversion_rate': ratio(buyers, visitors), 'spend': spend, 'clicks': clicks,
+        'impressions': impressions, 'ppc': ratio(spend, clicks, 2),
+        'click_rate': ratio(clicks, impressions), 'fee_ratio': ratio(spend, gmv),
+        'attributed_deal_amount': deals, 'roi': ratio(deals, spend, 2),
+        'deal_people': total(ads, 'deal_people') if len(ads) == 1 else None,
+        'source_semantics': {'gmv': '生意参谋实际支付', 'attributed_deal_amount': '无界归因成交'},
+        'quality': {'people_deduplicated': people_safe, 'attribution_windows_compatible': compatible,
+                    'attribution_windows': sorted(windows), 'missing_sources': [source for source, rows in [('shengyicanmou', shop), ('wujie', ads)] if not rows]},
+        'calculation_version': 'v2.0',
+    }
+
+
+def query_plan_totals(rows):
+    groups = {}
+    for row in rows:
+        key = (row['business_date'], row['scene_id'], row['plan_id'], row['batch_id'])
+        groups.setdefault(key, []).append(row)
+    result = []
+    for group in groups.values():
+        metrics = unified_metrics({'products': [], 'plans': group})
+        result.append({**{field: group[0][field] for field in ('business_date', 'scene_id', 'scene_name', 'plan_id', 'plan_name', 'batch_id', 'attribution_window')}, 'product_ids': [r['product_id'] for r in group], 'metrics': metrics})
+    return result
 
 
 def stored_results(source_type, account_id, date):
     db_path = DB_PATHS[source_type]
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT result_json FROM imports WHERE account_id = ? AND business_date = ? ORDER BY imported_at DESC",
+            "SELECT result_json FROM imports WHERE account_id = ? AND business_date = ? AND import_status = 'succeeded' ORDER BY imported_at DESC",
             (account_id, date),
         ).fetchall()
     return [json.loads(row[0]) for row in rows]
@@ -260,13 +575,15 @@ def stored_results_range(source_type, account_id, start_date, end_date):
             """SELECT i.result_json
                FROM imports i
               WHERE i.account_id = ?
+                AND i.import_status = 'succeeded'
                 AND i.business_date >= ?
                 AND i.business_date <= ?
                 AND NOT EXISTS (
                     SELECT 1 FROM imports newer
                      WHERE newer.account_id = i.account_id
                        AND newer.business_date = i.business_date
-                       AND newer.imported_at > i.imported_at
+                       AND newer.import_status = 'succeeded'
+                       AND (newer.imported_at > i.imported_at OR (newer.imported_at = i.imported_at AND newer.id > i.id))
                 )
               ORDER BY i.business_date ASC""",
             (account_id, start_date, end_date),
@@ -278,11 +595,11 @@ def upload_records(source_type, account_id):
     db_path = DB_PATHS[source_type]
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT batch_id, business_date, original_filename, row_count, file_sha256, imported_at FROM imports WHERE account_id = ? ORDER BY imported_at DESC",
+            "SELECT batch_id, business_date, original_filename, row_count, file_sha256, imported_at, import_status FROM imports WHERE account_id = ? ORDER BY imported_at DESC",
             (account_id,),
         ).fetchall()
     return [
-        {"batch_id": r[0], "date": r[1], "filename": r[2], "row_count": r[3], "sha256": r[4], "imported_at": r[5]}
+        {"batch_id": r[0], "date": r[1], "filename": r[2], "row_count": r[3], "sha256": r[4], "imported_at": r[5], 'status': r[6]}
         for r in rows
     ]
 
@@ -309,6 +626,10 @@ def delete_import(source_type, account_id, file_sha256):
             (file_path,),
         ).fetchone()
     if not still_used:
+        with sqlite3.connect(UNIFIED_DB) as conn:
+            source = conn.execute('SELECT id FROM source_files WHERE account_id=? AND sha256=?', (account_id, file_sha256)).fetchone()
+            if source:
+                conn.execute("UPDATE import_batches SET status='deleted', is_effective=0 WHERE source_file_id=?", (source[0],))
         try:
             Path(file_path).unlink(missing_ok=True)
         except OSError:
@@ -411,17 +732,80 @@ def decimal_number(value):
         return 0.0
 
 
-def read_csv_file(path):
+def nullable_number(value):
+    text = str(value if value is not None else "").strip().replace(",", "")
+    if not text or text == "-":
+        return None
+    percent = text.endswith('%')
+    number = float(text[:-1] if percent else text)
+    if not math.isfinite(number):
+        raise ValueError('非有限数值')
+    return number / 100 if percent else number
+
+
+def validate_business_dates(filename, dates):
+    if not dates:
+        raise ValueError(f"{filename}：报表内容缺少业务日期")
+    for value in dates:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(f"{filename}：业务日期格式异常：{value}") from exc
+    if len(dates) > 1:
+        raise ValueError(f"{filename}：同一文件包含多个业务日期：{', '.join(sorted(dates))}")
+
+
+def report_records(filename, data, source):
+    header = data[0]
+    if len(header) != len(set(header)):
+        raise ValueError(f'{filename}：报表存在重复表头')
+    required = {'统计日期', '商品ID', '商品名称', '支付金额', '成功退款金额', '支付件数', '商品访客数'} if source == 'shengyicanmou' else {'日期', '场景ID', '场景名字', '计划ID', '计划名字', '主体ID', '主体名称', '主体类型', '展现量', '点击量', '花费', '总成交金额', '总成交笔数', '成交人数', '直接成交金额', '间接成交金额', '直接成交笔数', '间接成交笔数', '总购物车数', '投入产出比'}
+    missing = required - set(header)
+    if missing:
+        raise ValueError(f'{filename}：缺少字段：{", ".join(sorted(missing))}')
+    records, keys = [], set()
+    for index, values in enumerate(data[1:], 2):
+        if not any(cell.strip() for cell in values):
+            continue
+        if len(values) != len(header):
+            raise ValueError(f'{filename}：第 {index} 行列数异常（{len(values)}/{len(header)}）')
+        row = dict(zip(header, values))
+        date = row['统计日期' if source == 'shengyicanmou' else '日期'].strip()
+        validate_business_dates(filename, {date})
+        if date > datetime.now().date().isoformat():
+            raise ValueError(f'{filename}：第 {index} 行业务日期在未来：{date}')
+        ids = ['商品ID'] if source == 'shengyicanmou' else ['主体ID', '计划ID', '场景ID']
+        for field in ids:
+            row[field] = row[field].strip()
+            if not row[field].isascii() or not row[field].isdigit():
+                raise ValueError(f'{filename}：第 {index} 行 {field} 必须是完整数字字符串，不能为科学计数法或小数')
+        if source == 'wujie' and row['主体类型'].strip() != '商品':
+            raise ValueError(f'{filename}：第 {index} 行主体类型不是商品')
+        key = (date, *(row[field] for field in ids))
+        if key in keys:
+            raise ValueError(f'{filename}：第 {index} 行业务键重复：{key}')
+        keys.add(key)
+        records.append(row)
+    if not records:
+        raise ValueError(f'{filename}：无有效商品数据行')
+    return records
+
+
+def read_csv_file_with_encoding(path):
     raw = path.read_bytes()
     for encoding in ("utf-8-sig", "gb18030", "utf-16"):
         try:
             text = raw.decode(encoding)
             rows = list(csv.reader(io.StringIO(text)))
             if rows and any(any(cell.strip() for cell in row) for row in rows[:20]):
-                return rows
+                return rows, encoding
         except (UnicodeDecodeError, csv.Error):
             continue
     raise ValueError("无法识别 CSV 编码")
+
+
+def read_csv_file(path):
+    return read_csv_file_with_encoding(path)[0]
 
 
 def convert_xls(path, temp_dir):
@@ -439,28 +823,33 @@ def convert_xls(path, temp_dir):
     return read_csv_file(converted)
 
 
-def find_header(rows, required):
+def find_header(rows, required, any_of=None):
     for index, row in enumerate(rows[:12]):
         normalized = [cell.strip() for cell in row]
-        if all(name in normalized for name in required):
+        if all(name in normalized for name in required) and (not any_of or any(name in normalized for name in any_of)):
             return index, normalized
     raise ValueError("未找到可识别的报表表头")
 
 
 def analyse_file(filename, data):
-    if {"支付金额", "成功退款金额", "支付件数", "支付买家数", "商品访客数"}.issubset(set(data[0])):
+    buyer_field = next((name for name in ("成交买家数量", "成交买家数", "支付买家数") if name in data[0]), None)
+    if buyer_field and {"支付金额", "成功退款金额", "支付件数", "商品访客数"}.issubset(set(data[0])):
         header = data[0]
-        rows = [dict(zip(header, row)) for row in data[1:] if any(cell.strip() for cell in row)]
+        rows = report_records(filename, data, 'shengyicanmou')
         gmv = sum(decimal_number(row.get("支付金额")) for row in rows)
         refunds = sum(decimal_number(row.get("成功退款金额")) for row in rows)
         units = sum(decimal_number(row.get("支付件数")) for row in rows)
-        buyers = sum(decimal_number(row.get("支付买家数")) for row in rows)
+        buyers = sum(decimal_number(row.get(buyer_field)) for row in rows)
         visitors = sum(decimal_number(row.get("商品访客数")) for row in rows)
+        dates = {str(row.get("统计日期", "")).strip() for row in rows if str(row.get("统计日期", "")).strip()}
+        validate_business_dates(filename, dates)
         return {
             "source": "生意参谋商品日报",
-            "date": rows[0].get("统计日期", "") if rows else "",
+            "date": next(iter(dates), ""),
+            "schema_version": "shengyicanmou-product-v1",
             "row_count": len(rows),
             "headers": header,
+            "records": rows,
             "metrics": {
                 "gmv": round(gmv, 2),
                 "successful_refund_amount": round(refunds, 2),
@@ -475,23 +864,52 @@ def analyse_file(filename, data):
         }
     if {"花费", "投入产出比", "总成交金额", "计划ID"}.issubset(set(data[0])):
         header = data[0]
-        rows = [dict(zip(header, row)) for row in data[1:] if any(cell.strip() for cell in row)]
+        rows = report_records(filename, data, 'wujie')
+        # 新版无界商品报表同时提供计划、商品和成交漏斗字段。保留旧报表
+        # 的基础字段兼容性，但所有可用汇总指标优先按新表原始字段重算。
+        impressions = sum(decimal_number(row.get("展现量")) for row in rows)
         spend = sum(decimal_number(row.get("花费")) for row in rows)
+        clicks = sum(decimal_number(row.get("点击量")) for row in rows)
         deals = sum(decimal_number(row.get("总成交金额")) for row in rows)
         direct = sum(decimal_number(row.get("直接成交金额")) for row in rows)
         indirect = sum(decimal_number(row.get("间接成交金额")) for row in rows)
-        clicks = sum(decimal_number(row.get("点击量")) for row in rows)
+        deal_orders = sum(decimal_number(row.get("总成交笔数")) for row in rows)
+        direct_orders = sum(decimal_number(row.get("直接成交笔数")) for row in rows)
+        indirect_orders = sum(decimal_number(row.get("间接成交笔数")) for row in rows)
+        deal_people = sum(decimal_number(row.get("成交人数")) for row in rows)
+        total_cart = sum(decimal_number(row.get("总购物车数")) for row in rows)
+        favorites = sum(decimal_number(row.get("总收藏数")) for row in rows)
+        dates = {str(row.get("日期", "")).strip() for row in rows if str(row.get("日期", "")).strip()}
+        validate_business_dates(filename, dates)
+        required_product = {"主体ID", "主体名称"}.issubset(set(header))
+        if filename.lower().endswith(".csv") and not required_product:
+            # The legacy plan report remains readable, but it cannot populate
+            # the product-plan relation required by the unified fact layer.
+            raise ValueError(f"{filename}：缺少主体ID/主体名称，无法作为无界商品报表导入")
         return {
-            "source": "无界计划报表",
-            "date": rows[0].get("日期", "") if rows else "",
+            "source": "无界商品报表",
+            "date": next(iter(dates), ""),
+            "schema_version": "wujie-product-v1",
             "row_count": len(rows),
             "headers": header,
+            "records": rows,
             "metrics": {
+                "impressions": int(impressions) if impressions.is_integer() else impressions,
                 "spend": round(spend, 2),
                 "total_deal_amount": round(deals, 2),
                 "direct_deal_amount": round(direct, 2),
                 "indirect_deal_amount": round(indirect, 2),
                 "clicks": int(clicks) if clicks.is_integer() else clicks,
+                "click_rate": round(clicks / impressions, 8) if impressions else None,
+                "ppc": round(spend / clicks, 2) if clicks else None,
+                "cpm": round(spend / impressions * 1000, 2) if impressions else None,
+                "total_deal_orders": int(deal_orders) if deal_orders.is_integer() else deal_orders,
+                "direct_deal_orders": int(direct_orders) if direct_orders.is_integer() else direct_orders,
+                "indirect_deal_orders": int(indirect_orders) if indirect_orders.is_integer() else indirect_orders,
+                "deal_people": int(deal_people) if deal_people.is_integer() else deal_people,
+                "click_conversion_rate": round(deal_orders / clicks, 8) if clicks else None,
+                "total_cart_count": int(total_cart) if total_cart.is_integer() else total_cart,
+                "total_favorite_count": int(favorites) if favorites.is_integer() else favorites,
                 "roi": round(deals / spend, 2) if spend else None,
                 "plan_roi_values": [decimal_number(row.get("投入产出比")) for row in rows],
             },
@@ -604,6 +1022,23 @@ class Handler(BaseHTTPRequestHandler):
             mtd["complete_days"] = complete_days
             mtd["missing_days_possible"] = max(0, end.day - complete_days)
             return self.send_json({"ok": True, "account_id": account["id"], "account_name": account["account_name"], "store": account["store_name"], "start_date": start_date, "end_date": end_date, "files": files, "mtd": {"month": end.strftime("%Y-%m"), "start_date": month_start, "end_date": end_date, "metrics": mtd, "targets": list(target_map.values())}})
+        if parsed.path.startswith('/api/unified/'):
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            start_date = query.get("start_date", [""])[0]
+            end_date = query.get("end_date", [start_date])[0]
+            if not account or not start_date or not end_date:
+                return self.send_json({"ok": False, "error": "需要有效 account_id、start_date 和 end_date"}, 400)
+            try:
+                data = query_unified(account['id'], start_date, end_date, query.get('product_id', [None])[0], query.get('plan_id', [None])[0], query.get('scene_id', [None])[0])
+                kind = parsed.path.rsplit('/', 1)[-1]
+                output = {'products': data['products'], 'plans': data['plans'], 'plan-totals': query_plan_totals(data['plans']), 'metrics': unified_metrics(data), 'batches': data['batches'], 'linked': data}.get(kind)
+                if output is None:
+                    return self.send_json({'ok': False, 'error': '未知统一查询接口'}, 404)
+                return self.send_json({'ok': True, 'account_id': account['id'], 'store_id': f"account:{account['id']}", 'data': output, 'batches': data['batches']})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({'ok': False, 'error': str(exc)}, 400)
         if parsed.path == "/api/upload-records":
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)
@@ -810,7 +1245,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(files, list):
                 files = [files]
             results = []
-            batch_id = datetime.now().strftime("local-%Y%m%d-%H%M%S")
+            batch_id = datetime.now().strftime("local-%Y%m%d-%H%M%S-") + secrets.token_hex(6)
             with tempfile.TemporaryDirectory(prefix="data-workbench-") as temp:
                 temp_dir = Path(temp)
                 for item in files:
@@ -818,24 +1253,35 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     content = item.file.read()
                     upload = temp_dir / Path(item.filename).name
+                    if upload.suffix.lower() != ('.xls' if source_type == 'shengyicanmou' else '.csv'):
+                        raise ValueError('生意参谋只接受 .xls，无界商品报表只接受 .csv')
                     upload.write_bytes(content)
                     if upload.suffix.lower() == ".xls":
                         rows = convert_xls(upload, temp_dir)
-                        header_index, header = find_header(rows, ["支付金额", "成功退款金额", "支付件数", "支付买家数", "商品访客数"])
+                        header_index, header = find_header(
+                            rows,
+                            ["支付金额", "成功退款金额", "支付件数", "商品访客数"],
+                            ["成交买家数量", "成交买家数", "支付买家数"],
+                        )
                         data = [header] + rows[header_index + 1 :]
+                        encoding = "libreoffice-csv"
                     else:
-                        rows = read_csv_file(upload)
+                        rows, encoding = read_csv_file_with_encoding(upload)
                         header_index, header = find_header(rows, ["花费", "投入产出比", "总成交金额", "计划ID"])
                         data = [header] + rows[header_index + 1 :]
                     result = analyse_file(upload.name, data)
-                    expected_source = "生意参谋商品日报" if source_type == "shengyicanmou" else "无界计划报表"
-                    if result["source"] != expected_source:
+                    result['row_numbers'] = [header_index + index + 1 for index, row in enumerate(rows[header_index + 1:], 1) if any(cell.strip() for cell in row)]
+                    result['attribution_window'] = (form.getfirst('attribution_window') or 'unknown').strip() if source_type == 'wujie' else 'not_applicable'
+                    expected_sources = {"生意参谋商品日报"} if source_type == "shengyicanmou" else {"无界商品报表", "无界计划报表"}
+                    if result["source"] not in expected_sources:
                         raise ValueError(f"{upload.name} 与选择的报表来源不匹配")
-                    saved = save_import(source_type, account_id, store_name, batch_id, upload.name, content, result)
-                    result["stored"] = not saved["duplicate"]
-                    result["duplicate"] = saved["duplicate"]
-                    result["sha256"] = saved["sha256"]
-                    results.append(result)
+                    saved = save_import(source_type, account_id, store_name, batch_id, upload.name, content, result, encoding)
+                    public_result = {key: value for key, value in result.items() if key not in ('records', 'row_numbers')}
+                    public_result["stored"] = not saved["duplicate"]
+                    public_result["duplicate"] = saved["duplicate"]
+                    public_result["sha256"] = saved["sha256"]
+                    public_result["unified_status"] = saved.get("unified_status")
+                    results.append(public_result)
             self.send_json({"ok": True, "batch_id": batch_id, "account_id": account_id, "account_name": account["account_name"], "store": store_name, "source_type": source_type, "files": results})
         except Exception as exc:
             self.send_json({"ok": False, "error": str(exc)}, 400)
