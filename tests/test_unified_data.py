@@ -5,6 +5,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -258,6 +259,109 @@ class UnifiedDataTest(unittest.TestCase):
         self.assertIsNone(metrics['roi'])
         self.assertFalse(metrics['attribution_windows_compatible'])
 
+    def series_fixture(self, name):
+        account = self.app.create_account(name, name)
+        date = '2026-10-08'
+        headers = ['统计日期', '商品ID', '商品名称', '支付金额', '成功退款金额', '支付件数', '商品访客数', '支付买家数']
+        rows = [[date, '919688715573', '系列商品A', '100', '5', '2', '50', '5'],
+                [date, '1027168958052', '系列商品B', '300', '15', '6', '100', '10']]
+        result = self.app.analyse_file('series-sc.csv', [headers, *rows])
+        self.app.save_import('shengyicanmou', account['id'], name, name, 'series-sc.csv', repr(rows).encode(), result, 'utf-8')
+        result, encoding = self.wujie_result()
+        self.app.save_import('wujie', account['id'], name, name, self.sample.name, self.sample.read_bytes(), result, encoding)
+        return account, date
+
+    def test_series_single_multi_and_versioned_members(self):
+        account, date = self.series_fixture('series-main')
+        aid = account['id']
+        first, second = '919688715573', '1027168958052'
+        saved = self.app.save_series(aid, {'name': '系列一', 'product_ids': [first]}, 1)
+        single = self.app.series_board(aid, saved['id'], date, date)
+        baby = self.app.baby_board(aid, first, date, date)
+        self.assertEqual(single['business'], baby['business'])
+        self.assertEqual(single['promotion'], baby['promotion'])
+        self.assertEqual(single['rows'][0]['sales_share'], 1)
+        updated = self.app.save_series(aid, {'series_id': saved['id'], 'revision': saved['revision'], 'name': '系列一', 'product_ids': [first, second]}, 1)
+        self.assertEqual(updated['current_version'], 2)
+        multi = self.app.series_board(aid, saved['id'], date, date)
+        self.assertEqual(multi['business']['gmv'], 400)
+        self.assertEqual(multi['promotion']['spend'], 100)
+        self.assertEqual(multi['promotion']['attributed_deal_amount'], 105)
+        self.assertEqual(multi['promotion']['roi'], 1.05)
+        self.assertEqual(multi['business']['conversion_rate'], .1)
+        self.assertEqual([r['sales_share'] for r in multi['rows']], [.25, .75])
+        self.assertEqual([r['spend_share'] for r in multi['rows']], [.7, .3])
+        self.assertEqual(sum(r['gmv'] for r in multi['rows']), multi['business']['gmv'])
+        old = self.app.series_board(aid, saved['id'], date, date, 1)
+        self.assertEqual(old['business'], single['business'])
+        self.assertEqual(old['product_ids'], [first])
+        renamed = self.app.save_series(aid, {'series_id': updated['id'], 'revision': updated['revision'], 'name': '改名', 'product_ids': [second, first]}, 1)
+        self.assertEqual(renamed['current_version'], 2)
+        removed = self.app.save_series(aid, {'series_id': renamed['id'], 'revision': renamed['revision'], 'name': '改名', 'product_ids': [second]}, 1)
+        self.assertEqual(removed['current_version'], 3)
+        self.assertEqual(self.app.series_board(aid, saved['id'], date, date)['business']['gmv'], 300)
+        self.app.init_databases()
+        self.assertEqual(self.app.list_series(aid)[0]['versions'][1]['product_ids'], [first, second])
+        self.assertEqual(self.app.series_board(aid, saved['id'], date, date, 2)['business']['gmv'], 400)
+
+    def test_series_validation_isolation_soft_delete_and_conflicts(self):
+        account, date = self.series_fixture('series-validation')
+        aid, pid = account['id'], '919688715573'
+        other = self.app.create_account('series-other', 'series-other')
+        for ids in [[], [pid, pid], [123], ['1e12'], ['not-id'], ['999999999999999999'], ['  ']]:
+            with self.assertRaises(ValueError):
+                self.app.save_series(aid, {'name': '无效', 'product_ids': ids}, 1)
+        with self.assertRaises(ValueError):
+            self.app.save_series(other['id'], {'name': '跨店铺', 'product_ids': [pid]}, 1)
+        saved = self.app.save_series(aid, {'name': '重复归属A', 'product_ids': [pid]}, 1)
+        self.app.save_series(aid, {'name': '重复归属B', 'product_ids': [pid]}, 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.app.save_series(aid, {'name': '重复归属A', 'product_ids': [pid]}, 1)
+        for action in [lambda: self.app.series_board(other['id'], saved['id'], date, date),
+                       lambda: self.app.delete_series(other['id'], saved['id'], 1),
+                       lambda: self.app.save_series(aid, {'series_id': saved['id'], 'revision': 0, 'name': '过期', 'product_ids': [pid]}, 1),
+                       lambda: self.app.series_board(aid, saved['id'], date, date, 999),
+                       lambda: self.app.series_board(aid, saved['id'], date, '2026-10-07')]:
+            with self.assertRaises(ValueError):
+                action()
+        self.app.delete_series(aid, saved['id'], saved['revision'])
+        with self.assertRaises(ValueError):
+            self.app.series_board(aid, saved['id'], date, date)
+        with sqlite3.connect(self.app.ACCOUNT_DB) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM series_members WHERE series_id=?', (saved['id'],)).fetchone()[0], 1)
+        self.assertEqual(self.app.baby_board(aid, pid, date, date)['business']['gmv'], 100)
+
+    def test_series_missing_data_windows_people_and_data_groups(self):
+        account, date = self.series_fixture('series-missing')
+        aid = account['id']
+        saved = self.app.save_series(aid, {'name': '缺数系列', 'product_ids': ['919688715573', '1066931268876']}, 1)
+        data = self.app.series_board(aid, saved['id'], '2026-10-07', date)
+        self.assertEqual(data['quality']['missing_business_products'], ['1066931268876'])
+        self.assertEqual(data['quality']['expected_product_days'], 4)
+        self.assertEqual(data['quality']['business_product_days'], 1)
+        self.assertIsNone(data['rows'][1]['sales_share'])
+        self.assertIsNone(data['business']['page_views'])
+        self.assertIn('非系列', data['quality']['people_note'])
+        empty = self.app.series_board(aid, saved['id'], '2026-10-01', '2026-10-02')
+        self.assertIsNone(empty['business']['gmv'])
+        self.assertIsNone(empty['promotion'])
+        result, encoding = self.wujie_result()
+        result['date'] = '2026-10-07'
+        for row in result['records']:
+            row['日期'] = '2026-10-07'
+        self.app.save_import('wujie', aid, 'series-missing', 'second-day', 'second.csv', b'second-series-day', result, encoding)
+        ranged = self.app.series_board(aid, saved['id'], '2026-10-07', date)
+        self.assertEqual(ranged['promotion']['spend'], 220)
+        self.assertIsNone(ranged['promotion']['roi'])
+        self.assertIsNone(ranged['promotion']['attributed_deal_amount'])
+        self.assertTrue(all(row['metrics']['roi'] is not None for row in ranged['trend']))
+        state = self.app.data_group_payload(aid, 'series')
+        self.assertTrue(next(item for item in state['metrics'] if item['metric_code'] == 'gmv')['available'])
+        custom = self.app.save_data_group(aid, {'board': 'series', 'name': '系列核心组', 'metric_codes': ['spend', 'gmv', 'roi']}, 1)
+        self.app.select_data_group(aid, 'series', custom['id'])
+        self.app.init_databases()
+        self.assertEqual(self.app.data_group_payload(aid, 'series')['selected_group_id'], custom['id'])
+
     def test_data_groups_are_account_scoped_and_board_aware(self):
         account = self.app.create_account('group-account', 'group-store')
         other = self.app.create_account('group-other', 'group-other-store')
@@ -276,6 +380,13 @@ class UnifiedDataTest(unittest.TestCase):
         self.assertNotIn('我的核心组', {g['name'] for g in self.app.data_group_payload(other['id'], 'baby')['groups']})
         self.app.delete_data_group(account['id'], custom['id'])
         self.assertNotEqual(self.app.data_group_payload(account['id'], 'baby')['selected_group_id'], custom['id'])
+
+    def test_data_groups_concurrent_first_load(self):
+        account = self.app.create_account('concurrent-groups', 'concurrent-groups')
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            states = list(pool.map(lambda board: self.app.data_group_payload(account['id'], board), ['store', 'baby', 'plan', 'series'] * 2))
+        self.assertTrue(all(len(state['groups']) == 4 for state in states))
+        self.assertEqual({tuple(group['id'] for group in state['groups']) for state in states}.__len__(), 1)
 
 
 if __name__ == '__main__':

@@ -2,12 +2,22 @@
 
 更新日期：2026-10-09（Asia/Shanghai）
 
+## 任务 04：系列看板
+
+- 账号库增量新增 `product_series`、`series_versions`、`series_members`，分别保存系列本体、不可变成员版本和版本成员；删除系列使用 `deleted_at` 软删除。
+- 后端主函数为 `list_series()`、`save_series()`、`delete_series()`、`series_board()`。`query_unified()` 增加 `product_ids` SQL 筛选，仍分开读取经营和推广事实。
+- 接口为 `GET /api/series`、`POST /api/series`、`POST /api/series/delete`、`GET /api/series-board`；所有接口都先校验 `account_id`，成员 ID 还必须存在于该账号的统一商品表。
+- 前端页面骨架和公共样式在 `static/index.html`，系列状态、CRUD、趋势、明细排序和宝贝跳转在 `static/series.js`。系列已接入公共数据组注册和店铺切换清理。
+- `tests/test_unified_data.py` 覆盖计算、版本和校验；`tests/serve_series_fixture.py` 只创建临时数据目录，`tests/test_series_browser.cjs` 运行 Playwright 端到端验收，不读写默认经营库。
+- 回滚时可仅回退代码并保留新表；不要删库或清空原始数据。
+- 任务 04 收尾已获用户本地提交授权，提交范围限定本模块 9 个代码、测试和文档文件；不推送、不部署。验收明细及下一模块依赖见 `HANDOFF.md` 的任务 04 收尾检查。
+
 ## 任务 03：公共数据组模块
 
 - 指标注册信息集中在 `app.py` 的 `METRIC_REGISTRY`，并同步写入统一库 `metric_definitions`；看板不得再维护重复指标字典。
 - 账号库新增 `data_groups`、`data_group_items`、`data_group_preferences`。系统组包括成交、流量、互动、推广四组；自定义组按账号保存，当前选择按账号和看板保存。
 - 公共接口为 `GET /api/data-groups`、`POST /api/data-groups`、`POST /api/data-groups/select`、`POST /api/data-groups/delete`。
-- 数据组只改变现有看板指标卡的选择与顺序，不计算业务数据。宝贝、计划和经营看板已接入；系列看板尚无页面和数据接口，暂不显示。
+- 数据组只改变现有看板指标卡的选择与顺序，不计算业务数据。宝贝、计划、系列和经营看板已接入。
 - 计划看板对经营指标返回 `available=false`；宝贝看板对不存在的指标同样不显示替代口径。
 
 ## 技术栈与运行方式

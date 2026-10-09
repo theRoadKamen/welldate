@@ -81,6 +81,10 @@ DATA_GROUP_PRESETS = {
     "推广数据组": ["spend", "attributed_deal_amount", "total_deal_amount", "total_deal_orders", "ppc", "roi", "fee_ratio"],
 }
 BOARD_CODES = {"store", "baby", "series", "plan"}
+# Series uses product-level facts and the same metric definitions as the baby board.
+for definition in METRIC_REGISTRY.values():
+    if "baby" in definition["boards"]:
+        definition["boards"].append("series")
 
 
 def source_label(source_type):
@@ -169,6 +173,32 @@ def init_databases():
                 group_id INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(account_id, board_code)
+            );
+            CREATE TABLE IF NOT EXISTS product_series (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                current_version INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS series_active_name
+                ON product_series(account_id, name) WHERE deleted_at IS NULL;
+            CREATE TABLE IF NOT EXISTS series_versions (
+                series_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by INTEGER,
+                PRIMARY KEY(series_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS series_members (
+                series_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                product_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(series_id, version, product_id)
             );
         """)
     with sqlite3.connect(UNIFIED_DB) as conn:
@@ -533,6 +563,7 @@ def persist_unified_import(source_type, account_id, store_name, batch_id, filena
 def _ensure_system_groups(account_id):
     now = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(ACCOUNT_DB) as conn:
+        conn.execute('BEGIN IMMEDIATE')
         for name, metrics in DATA_GROUP_PRESETS.items():
             row = conn.execute("SELECT id FROM data_groups WHERE account_id=? AND preset_code=? AND deleted_at IS NULL", (account_id, name)).fetchone()
             if row:
@@ -647,7 +678,7 @@ def save_import(source_type, account_id, store_name, batch_id, filename, content
     return {"duplicate": False, "sha256": digest, "result": result, "unified_status": unified.get("status")}
 
 
-def query_unified(account_id, start_date, end_date, product_id=None, plan_id=None, scene_id=None):
+def query_unified(account_id, start_date, end_date, product_id=None, plan_id=None, scene_id=None, product_ids=None):
     """Read the two grains independently; never join business facts to plan rows."""
     start = datetime.strptime(start_date, '%Y-%m-%d').date()
     end = datetime.strptime(end_date, '%Y-%m-%d').date()
@@ -659,6 +690,9 @@ def query_unified(account_id, start_date, end_date, product_id=None, plan_id=Non
         for name, table in [('products', 'daily_product_facts'), ('plans', 'daily_plan_product_facts')]:
             conditions = ['f.account_id=?', 'f.business_date BETWEEN ? AND ?', 'b.is_effective=1', "b.status='succeeded'"]
             values = [account_id, start_date, end_date]
+            if product_ids is not None:
+                conditions.append(f"f.product_id IN ({','.join('?' for _ in product_ids)})" if product_ids else '0')
+                values.extend(product_ids)
             for field, value in [('product_id', product_id), ('plan_id', plan_id), ('scene_id', scene_id)]:
                 if value is not None and (name == 'plans' or field == 'product_id'):
                     conditions.append(f'f.{field}=?')
@@ -744,6 +778,146 @@ def promotion_metrics(rows):
         'attribution_windows_compatible': compatible,
         'attribution_windows': sorted(windows),
     }
+
+
+def business_metrics(rows):
+    result = {field: total_metric(rows, field) for field in (
+        'visitors', 'page_views', 'cart_people', 'cart_items', 'paid_buyers',
+        'paid_units', 'gmv', 'successful_refund_amount',
+    )}
+    result['conversion_rate'] = metric_ratio(result['paid_buyers'], result['visitors'])
+    result['refund_rate'] = metric_ratio(result['successful_refund_amount'], result['gmv'])
+    return result
+
+
+def list_series(account_id):
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM product_series WHERE account_id=? AND deleted_at IS NULL ORDER BY id", (account_id,)).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            versions = []
+            for version in conn.execute('SELECT version, created_at FROM series_versions WHERE series_id=? ORDER BY version DESC', (row['id'],)).fetchall():
+                members = [r[0] for r in conn.execute('SELECT product_id FROM series_members WHERE series_id=? AND version=? ORDER BY position', (row['id'], version['version']))]
+                versions.append({**dict(version), 'product_ids': members})
+            item['versions'] = versions
+            item['product_ids'] = versions[0]['product_ids']
+            output.append(item)
+    return output
+
+
+def save_series(account_id, payload, user_id):
+    name = payload.get('name')
+    ids = payload.get('product_ids')
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 40:
+        raise ValueError('系列名称不能为空，最多 40 字')
+    if not isinstance(ids, list) or not ids or len(ids) > 500:
+        raise ValueError('每个系列需包含 1 至 500 个商品')
+    if any(not isinstance(pid, str) or not pid.strip().isascii() or not pid.strip().isdigit() for pid in ids):
+        raise ValueError('商品 ID 必须是完整数字字符串')
+    ids = [pid.strip() for pid in ids]
+    if len(set(ids)) != len(ids):
+        raise ValueError('同一系列不能重复添加商品')
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        found = {r[0] for r in conn.execute(f"SELECT product_id FROM products WHERE account_id=? AND product_id IN ({','.join('?' for _ in ids)})", [account_id, *ids])}
+    if found != set(ids):
+        raise ValueError('当前店铺未找到商品 ID：' + '、'.join(pid for pid in ids if pid not in found))
+    now = datetime.now().isoformat(timespec='seconds')
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        series_id = payload.get('series_id')
+        if series_id is not None:
+            row = conn.execute('SELECT current_version, revision FROM product_series WHERE account_id=? AND id=? AND deleted_at IS NULL', (account_id, series_id)).fetchone()
+            if not row:
+                raise ValueError('当前店铺未找到该系列')
+            if payload.get('revision') != row[1]:
+                raise ValueError('系列已被修改，请刷新后重试')
+            version = row[0]
+            old_ids = {r[0] for r in conn.execute('SELECT product_id FROM series_members WHERE series_id=? AND version=?', (series_id, version))}
+            changed = old_ids != set(ids)
+            if changed:
+                version += 1
+            conn.execute('UPDATE product_series SET name=?, current_version=?, revision=revision+1, updated_at=? WHERE id=?', (name.strip(), version, now, series_id))
+        else:
+            series_id = conn.execute('INSERT INTO product_series(account_id,name,created_at,updated_at) VALUES (?,?,?,?)', (account_id, name.strip(), now, now)).lastrowid
+            version, changed = 1, True
+        if changed:
+            conn.execute('INSERT INTO series_versions VALUES (?,?,?,?)', (series_id, version, now, user_id))
+            conn.executemany('INSERT INTO series_members VALUES (?,?,?,?)', [(series_id, version, pid, index) for index, pid in enumerate(ids)])
+    return next(item for item in list_series(account_id) if item['id'] == int(series_id))
+
+
+def delete_series(account_id, series_id, revision):
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        cursor = conn.execute('UPDATE product_series SET deleted_at=?, revision=revision+1 WHERE account_id=? AND id=? AND revision=? AND deleted_at IS NULL', (datetime.now().isoformat(timespec='seconds'), account_id, series_id, revision))
+        if not cursor.rowcount:
+            raise ValueError('系列不存在或已被修改，请刷新后重试')
+
+
+def series_board(account_id, series_id, start_date, end_date, version=None):
+    series = next((item for item in list_series(account_id) if item['id'] == int(series_id)), None)
+    if not series:
+        raise ValueError('当前店铺未找到该系列')
+    version = series['current_version'] if version is None else int(version)
+    snapshot = next((item for item in series['versions'] if item['version'] == version), None)
+    if not snapshot:
+        raise ValueError('系列成员版本不存在')
+    ids = snapshot['product_ids']
+    data = query_unified(account_id, start_date, end_date, product_ids=ids)
+    shop, ads = data['products'], data['plans']
+    business = business_metrics(shop)
+    summary = promotion_metrics(ads)
+    promotion = {key: value for key, value in summary.items() if not key.startswith('attribution_windows')} if ads else None
+    # Membership snapshots and source batches are distinct: a snapshot fixes the set, not the facts.
+    def combined_metrics(business_rows, promotion_rows):
+        values = business_metrics(business_rows)
+        values.update(promotion_metrics(promotion_rows))
+        gmv, refund = values['gmv'], values['successful_refund_amount']
+        values.update(gsv=round(gmv - refund, 2) if gmv is not None and refund is not None else None,
+                      average_order_value=metric_ratio(gmv, values['paid_units'], 2),
+                      fee_ratio=metric_ratio(values['spend'], gmv),
+                      total_cart_count=total_metric(promotion_rows, 'total_cart_count'))
+        return values
+    metrics = combined_metrics(shop, ads)
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        names = dict(conn.execute('SELECT product_id, product_name FROM products WHERE account_id=?', (account_id,)))
+    rows, missing_business, missing_promotion = [], [], []
+    for pid in ids:
+        product_shop = [r for r in shop if r['product_id'] == pid]
+        product_ads = [r for r in ads if r['product_id'] == pid]
+        if not product_shop:
+            missing_business.append(pid)
+        if not product_ads:
+            missing_promotion.append(pid)
+        item = combined_metrics(product_shop, product_ads)
+        rows.append({'product_id': pid, 'product_name': names.get(pid), **item,
+                     'has_business': bool(product_shop), 'has_promotion': bool(product_ads),
+                     'sales_share': metric_ratio(item['gmv'], business['gmv']),
+                     'spend_share': metric_ratio(item['spend'], summary['spend'])})
+    dates = {}
+    for source, facts in [('products', shop), ('plans', ads)]:
+        for row in facts:
+            dates.setdefault(row['business_date'], {'products': [], 'plans': []})[source].append(row)
+    start, end = (datetime.strptime(date, '%Y-%m-%d').date() for date in (start_date, end_date))
+    trend = []
+    for offset in range((end-start).days+1):
+        date = (start+timedelta(days=offset)).isoformat()
+        daily = dates.get(date, {'products': [], 'plans': []})
+        trend.append({'date': date, 'metrics': combined_metrics(daily['products'], daily['plans'])})
+    expected = len(ids) * len(trend)
+    return {'series': series, 'member_version': version, 'product_ids': ids,
+            'membership_scope': 'fixed_version_for_entire_period',
+            'start_date': start_date, 'end_date': end_date,
+            'business': business, 'promotion': promotion, 'metrics': metrics, 'trend': trend, 'rows': rows,
+            'quality': {'has_business': bool(shop), 'has_promotion': bool(ads),
+                        'people_note': '商品日人数累加，非系列或周期去重；支付转化率为商品日买家数合计 / 商品日访客数合计。',
+                        'attribution_windows_compatible': summary['attribution_windows_compatible'],
+                        'missing_business_products': missing_business, 'missing_promotion_products': missing_promotion,
+                        'business_product_days': len(shop), 'expected_product_days': expected,
+                        'promotion_product_days': len({(r['product_id'], r['business_date']) for r in ads}),
+                        'contribution_note': '贡献占比基于所选成员、日期内已导入的有效记录；无记录不等于真实零。'},
+            'source_semantics': {'gmv': '生意参谋实际支付金额', 'attributed_deal_amount': '无界归因成交金额'}}
 
 
 def plan_board_options(account_id, start_date, end_date):
@@ -890,20 +1064,7 @@ def baby_board(account_id, product_id, start_date, end_date):
     def ratio(numerator, denominator, precision=8):
         return round(numerator / denominator, precision) if numerator is not None and denominator else None
 
-    visitors = total(shop, 'visitors')
-    page_views = total(shop, 'page_views')
-    cart_people = total(shop, 'cart_people')
-    cart_items = total(shop, 'cart_items')
-    paid_buyers = total(shop, 'paid_buyers')
-    paid_units = total(shop, 'paid_units')
-    gmv = total(shop, 'gmv')
-    refunds = total(shop, 'successful_refund_amount')
-    business = {
-        'visitors': visitors, 'page_views': page_views, 'cart_people': cart_people,
-        'cart_items': cart_items, 'paid_buyers': paid_buyers, 'paid_units': paid_units,
-        'gmv': gmv, 'successful_refund_amount': refunds,
-        'conversion_rate': ratio(paid_buyers, visitors), 'refund_rate': ratio(refunds, gmv),
-    }
+    business = business_metrics(shop)
 
     promotion_summary = promotion_metrics(ads)
     windows = set(promotion_summary['attribution_windows'])
@@ -1391,6 +1552,19 @@ class Handler(BaseHTTPRequestHandler):
             if not account or len(month) != 7:
                 return self.send_json({"ok": False, "error": "需要有效 account_id 和 YYYY-MM 月份"}, 400)
             return self.send_json({"ok": True, "account_id": account["id"], "month": month, "targets": target_rows(account["id"], month)})
+        if parsed.path in ("/api/series", "/api/series-board"):
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get('account_id', [''])[0])
+            if not account:
+                return self.send_json({'ok': False, 'error': '请先选择有效店铺'}, 400)
+            try:
+                output = list_series(account['id']) if parsed.path == '/api/series' else series_board(
+                    account['id'], query.get('series_id', [''])[0], query.get('start_date', [''])[0],
+                    query.get('end_date', [''])[0], query.get('version', [None])[0])
+                return self.send_json({'ok': True, 'account_id': account['id'], 'data': output})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({'ok': False, 'error': str(exc)}, 400)
         if parsed.path == "/api/data-groups":
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)
@@ -1663,6 +1837,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "目标值必须是数字或留空"}, 400)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path in ('/api/series', '/api/series/delete'):
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))) or b'{}')
+                if not isinstance(payload, dict):
+                    raise ValueError('请求内容必须是对象')
+                account = account_by_id(payload.get('account_id'))
+                if not account:
+                    raise ValueError('请先选择有效店铺')
+                if path.endswith('/delete'):
+                    delete_series(account['id'], int(payload.get('series_id')), payload.get('revision'))
+                    output = list_series(account['id'])
+                else:
+                    output = save_series(account['id'], payload, user['id'])
+                return self.send_json({'ok': True, 'account_id': account['id'], 'data': output})
+            except sqlite3.IntegrityError:
+                return self.send_json({'ok': False, 'error': '当前店铺已存在同名系列'}, 400)
+            except (ValueError, TypeError) as exc:
+                return self.send_json({'ok': False, 'error': str(exc)}, 400)
         if path in ("/api/data-groups", "/api/data-groups/select", "/api/data-groups/delete"):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
