@@ -19,6 +19,10 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || '/Users/well/.cache/
     await page.reload();
     assert.equal(await page.locator('#data-group-modal').isHidden(), true);
     await page.locator('.store-card[data-account-id="2"]').click();
+    await page.locator('.nav-board').click();
+    await page.waitForFunction(() => document.querySelectorAll('#metrics [data-metric]').length === 23);
+    assert.equal(await page.locator('#store-data-group').count(), 0);
+    assert.deepEqual(await page.locator('#metrics .metric-heading h2').allTextContents(), ['核心经营指标']);
     await page.locator('.nav-series').click();
     await page.locator('#series-select option').filter({hasText: '单商品系列'}).waitFor({state: 'attached'});
     await page.locator('#series-start-date').fill('2026-10-08');
