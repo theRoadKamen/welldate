@@ -137,6 +137,48 @@ class UnifiedDataTest(unittest.TestCase):
         with sqlite3.connect(self.app.UNIFIED_DB) as conn:
             self.assertEqual(conn.execute('SELECT status, is_effective FROM import_batches WHERE account_id=?', (other['id'],)).fetchone(), ('deleted', 0))
 
+    def test_baby_board_single_multi_and_no_promotion_products(self):
+        account = self.app.create_account('baby-board-account', 'baby-board-store')
+        date = '2026-10-08'
+        sc_headers = ['统计日期', '商品ID', '商品名称', '支付金额', '成功退款金额', '支付件数', '商品访客数', '支付买家数', '商品浏览量', '商品加购人数', '商品加购件数', '商品支付转化率']
+        product_rows = [
+            [date, '1001', '单计划商品', '100', '0', '2', '50', '5', '80', '4', '6', '0.1'],
+            [date, '1002', '多计划商品', '200', '10', '3', '100', '8', '160', '7', '11', '0.08'],
+            [date, '1003', '无推广商品', '300', '0', '4', '120', '9', '210', '5', '8', '0.075'],
+        ]
+        sc_content = ('\n'.join([','.join(sc_headers), *[','.join(row) for row in product_rows]])).encode('utf-8')
+        sc_result = self.app.analyse_file('baby-sc.csv', [sc_headers, *product_rows])
+        self.app.save_import('shengyicanmou', account['id'], 'baby-board-store', 'baby-sc', 'baby-sc.csv', sc_content, sc_result, 'utf-8')
+        wj_headers = ['日期', '场景ID', '场景名字', '计划ID', '计划名字', '主体ID', '主体类型', '主体名称', '展现量', '点击量', '花费', '直接成交金额', '间接成交金额', '总成交金额', '直接成交笔数', '间接成交笔数', '总成交笔数', '成交人数', '总购物车数', '投入产出比']
+        wj_rows = [
+            [date, '1', '关键词推广', '11', '单计划', '1001', '商品', '单计划商品', '1000', '100', '20', '30', '0', '30', '1', '0', '1', '1', '2', '1.5'],
+            [date, '1', '关键词推广', '12', '多计划A', '1002', '商品', '多计划商品', '500', '50', '10', '12', '0', '12', '1', '0', '1', '1', '1', '1.2'],
+            [date, '2', '货品全站推广', '13', '多计划B', '1002', '商品', '多计划商品', '300', '30', '5', '8', '0', '8', '1', '0', '1', '1', '1', '1.6'],
+        ]
+        wj_content = ('\n'.join([','.join(wj_headers), *[','.join(row) for row in wj_rows]])).encode('utf-8')
+        wj_result = self.app.analyse_file('baby-wj.csv', [wj_headers, *wj_rows])
+        self.app.save_import('wujie', account['id'], 'baby-board-store', 'baby-wj', 'baby-wj.csv', wj_content, wj_result, 'utf-8')
+        single = self.app.baby_board(account['id'], '1001', date, date)
+        multi = self.app.baby_board(account['id'], '1002', date, date)
+        empty = self.app.baby_board(account['id'], '1003', date, date)
+        self.assertEqual(single['business']['gmv'], 100.0)
+        self.assertEqual(single['promotion']['spend'], 20.0)
+        self.assertEqual(len(single['plans']), 1)
+        self.assertEqual(multi['business']['gmv'], 200.0)
+        self.assertEqual(multi['business']['page_views'], 160.0)
+        self.assertEqual(multi['business']['cart_people'], 7.0)
+        self.assertEqual(multi['business']['conversion_rate'], 0.08)
+        self.assertEqual(multi['promotion']['spend'], 15.0)
+        self.assertEqual(multi['promotion']['attributed_deal_amount'], 20.0)
+        self.assertEqual(len(multi['plans']), 2)
+        self.assertIsNone(empty['promotion'])
+        self.assertEqual(empty['quality']['promotion_empty_message'], '无推广记录')
+        ranged = self.app.baby_board(account['id'], '1002', '2026-10-07', date)
+        self.assertEqual(ranged['quality']['people_scope'], 'daily_sum_not_period_deduplicated')
+        self.assertEqual(len(ranged['trend']), 2)
+        products = self.app.list_baby_products(account['id'], '多计划')
+        self.assertEqual([item['product_id'] for item in products], ['1002'])
+
 
 if __name__ == '__main__':
     unittest.main()

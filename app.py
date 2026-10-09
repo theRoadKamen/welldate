@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import math
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -241,6 +241,10 @@ def init_databases():
         for name, definition in [('attribution_window', "TEXT NOT NULL DEFAULT 'unknown'"), ('headers_json', "TEXT NOT NULL DEFAULT '[]'")]:
             if name not in columns:
                 conn.execute(f'ALTER TABLE import_batches ADD COLUMN {name} {definition}')
+        product_fact_columns = {r[1] for r in conn.execute('PRAGMA table_info(daily_product_facts)')}
+        for name in ('page_views', 'cart_people', 'cart_items'):
+            if name not in product_fact_columns:
+                conn.execute(f'ALTER TABLE daily_product_facts ADD COLUMN {name} REAL')
         metric_rows = [
             ("gmv", "GMV", "SUM(支付金额)", "sum", "v2.0"),
             ("refund_rate", "退款率", "SUM(成功退款金额)/SUM(支付金额)", "ratio", "v2.0"),
@@ -437,7 +441,7 @@ def persist_unified_import(source_type, account_id, store_name, batch_id, filena
                     name = str(row.get("商品名称") or "").strip()
                     conn.execute("INSERT INTO products(account_id,store_id,product_id,product_name,first_seen_date,last_seen_date) VALUES (?,?,?,?,?,?) ON CONFLICT(account_id,product_id) DO UPDATE SET product_name=excluded.product_name,last_seen_date=excluded.last_seen_date", (account_id, store_id, entity_id, name, date, date))
                     buyer_field = next(name for name in ('成交买家数量', '成交买家数', '支付买家数') if name in row)
-                    conn.execute("INSERT INTO daily_product_facts(account_id,store_id,business_date,product_id,batch_id,source_type,visitors,paid_buyers,paid_units,gmv,successful_refund_amount,raw_conversion_rate,quality_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (account_id, store_id, date, entity_id, batch_db_id, source_type, number("商品访客数"), number(buyer_field), number("支付件数"), number("支付金额"), number("成功退款金额"), nullable_number(row.get("商品支付转化率")), "valid"))
+                    conn.execute("""INSERT INTO daily_product_facts(account_id,store_id,business_date,product_id,batch_id,source_type,visitors,paid_buyers,paid_units,gmv,successful_refund_amount,raw_conversion_rate,quality_status,page_views,cart_people,cart_items) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (account_id, store_id, date, entity_id, batch_db_id, source_type, number("商品访客数"), number(buyer_field), number("支付件数"), number("支付金额"), number("成功退款金额"), nullable_number(row.get("商品支付转化率")), "valid", nullable_number(row.get("商品浏览量")), nullable_number(row.get("商品加购人数")), nullable_number(row.get("商品加购件数"))))
             else:
                 entity_type, entity_id = "plan_product", str(row.get("主体ID") or "").strip() or None
                 conn.execute("INSERT INTO raw_rows(batch_id,row_number,business_date,entity_type,entity_id,raw_payload,row_hash) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, date, entity_type, entity_id, json.dumps(row, ensure_ascii=False), hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()))
@@ -555,6 +559,139 @@ def query_plan_totals(rows):
         metrics = unified_metrics({'products': [], 'plans': group})
         result.append({**{field: group[0][field] for field in ('business_date', 'scene_id', 'scene_name', 'plan_id', 'plan_name', 'batch_id', 'attribution_window')}, 'product_ids': [r['product_id'] for r in group], 'metrics': metrics})
     return result
+
+
+def list_baby_products(account_id, keyword="", limit=100):
+    keyword = str(keyword or "").strip()
+    like = f"%{keyword}%"
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT p.product_id, p.product_name, p.first_seen_date, p.last_seen_date,
+                      EXISTS(SELECT 1 FROM daily_product_facts f JOIN import_batches b ON b.id=f.batch_id
+                             WHERE f.account_id=p.account_id AND f.product_id=p.product_id
+                               AND b.status='succeeded' AND b.is_effective=1) AS has_business,
+                      EXISTS(SELECT 1 FROM daily_plan_product_facts f JOIN import_batches b ON b.id=f.batch_id
+                             WHERE f.account_id=p.account_id AND f.product_id=p.product_id
+                               AND b.status='succeeded' AND b.is_effective=1) AS has_promotion
+                 FROM products p
+                WHERE p.account_id=? AND (?='' OR p.product_id LIKE ? OR COALESCE(p.product_name,'') LIKE ?)
+                ORDER BY p.last_seen_date DESC, p.product_id
+                LIMIT ?""",
+            (account_id, keyword, like, like, max(1, min(int(limit), 200))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def baby_board(account_id, product_id, start_date, end_date):
+    data = query_unified(account_id, start_date, end_date, product_id=product_id)
+    shop, ads = data['products'], data['plans']
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        product = conn.execute(
+            "SELECT product_id, product_name, first_seen_date, last_seen_date FROM products WHERE account_id=? AND product_id=?",
+            (account_id, str(product_id)),
+        ).fetchone()
+    if not product:
+        raise ValueError('当前店铺未找到该商品 ID')
+
+    def total(rows, field):
+        values = [row.get(field) for row in rows]
+        if not values or any(value is None for value in values):
+            return None
+        return round(sum(values), 8)
+
+    def ratio(numerator, denominator, precision=8):
+        return round(numerator / denominator, precision) if numerator is not None and denominator else None
+
+    visitors = total(shop, 'visitors')
+    page_views = total(shop, 'page_views')
+    cart_people = total(shop, 'cart_people')
+    cart_items = total(shop, 'cart_items')
+    paid_buyers = total(shop, 'paid_buyers')
+    paid_units = total(shop, 'paid_units')
+    gmv = total(shop, 'gmv')
+    refunds = total(shop, 'successful_refund_amount')
+    business = {
+        'visitors': visitors, 'page_views': page_views, 'cart_people': cart_people,
+        'cart_items': cart_items, 'paid_buyers': paid_buyers, 'paid_units': paid_units,
+        'gmv': gmv, 'successful_refund_amount': refunds,
+        'conversion_rate': ratio(paid_buyers, visitors), 'refund_rate': ratio(refunds, gmv),
+    }
+
+    windows = {row['attribution_window'] for row in ads}
+    attribution_compatible = len(windows) == 1 and ('unknown' not in windows or len({row['batch_id'] for row in ads}) == 1)
+    impressions = total(ads, 'impressions')
+    clicks = total(ads, 'clicks')
+    spend = total(ads, 'spend')
+    attributed = total(ads, 'total_deal_amount') if attribution_compatible else None
+    promotion = None if not ads else {
+        'impressions': impressions, 'clicks': clicks, 'spend': spend,
+        'click_rate': ratio(clicks, impressions), 'ppc': ratio(spend, clicks, 2),
+        'attributed_deal_amount': attributed, 'roi': ratio(attributed, spend, 2),
+        'total_deal_orders': total(ads, 'total_deal_orders'),
+    }
+
+    start = datetime.strptime(start_date, '%Y-%m-%d').date()
+    end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    by_date = {}
+    for offset in range((end - start).days + 1):
+        date = (start + timedelta(days=offset)).isoformat()
+        by_date[date] = {'date': date, 'business': None, 'promotion': None}
+    for date in by_date:
+        daily_shop = [row for row in shop if row['business_date'] == date]
+        daily_ads = [row for row in ads if row['business_date'] == date]
+        if daily_shop:
+            daily_visitors = total(daily_shop, 'visitors')
+            daily_buyers = total(daily_shop, 'paid_buyers')
+            by_date[date]['business'] = {
+                'visitors': daily_visitors, 'page_views': total(daily_shop, 'page_views'),
+                'paid_buyers': daily_buyers, 'gmv': total(daily_shop, 'gmv'),
+                'conversion_rate': ratio(daily_buyers, daily_visitors),
+            }
+        if daily_ads:
+            daily_spend = total(daily_ads, 'spend')
+            daily_deals = total(daily_ads, 'total_deal_amount')
+            by_date[date]['promotion'] = {
+                'impressions': total(daily_ads, 'impressions'), 'clicks': total(daily_ads, 'clicks'),
+                'spend': daily_spend, 'attributed_deal_amount': daily_deals,
+                'roi': ratio(daily_deals, daily_spend, 2),
+            }
+
+    plan_groups = {}
+    for row in ads:
+        key = (row['scene_id'], row['plan_id'], row['attribution_window'])
+        plan_groups.setdefault(key, []).append(row)
+    plans = []
+    for group in plan_groups.values():
+        group_spend = total(group, 'spend')
+        group_deals = total(group, 'total_deal_amount')
+        plans.append({
+            'scene_id': group[0]['scene_id'], 'scene_name': group[0]['scene_name'],
+            'plan_id': group[0]['plan_id'], 'plan_name': group[0]['plan_name'],
+            'attribution_window': group[0]['attribution_window'],
+            'start_date': min(row['business_date'] for row in group),
+            'end_date': max(row['business_date'] for row in group),
+            'impressions': total(group, 'impressions'), 'clicks': total(group, 'clicks'),
+            'spend': group_spend, 'attributed_deal_amount': group_deals,
+            'click_rate': ratio(total(group, 'clicks'), total(group, 'impressions')),
+            'ppc': ratio(group_spend, total(group, 'clicks'), 2), 'roi': ratio(group_deals, group_spend, 2),
+        })
+    plans.sort(key=lambda row: (-(row['spend'] or 0), row['plan_id']))
+    multi_day = start_date != end_date
+    return {
+        'product': dict(product), 'start_date': start_date, 'end_date': end_date,
+        'business': business, 'promotion': promotion, 'trend': list(by_date.values()), 'plans': plans,
+        'quality': {
+            'has_business': bool(shop), 'has_promotion': bool(ads),
+            'people_scope': 'daily_sum_not_period_deduplicated' if multi_day else 'single_day',
+            'people_note': '跨日人数为每日数值累加，不等于周期去重人数。' if multi_day else '单日人数口径。',
+            'attribution_windows_compatible': attribution_compatible,
+            'attribution_windows': sorted(windows),
+            'promotion_empty_message': None if ads else '无推广记录',
+        },
+        'source_semantics': {'gmv': '生意参谋实际支付金额', 'attributed_deal_amount': '无界归因成交金额'},
+    }
 
 
 def stored_results(source_type, account_id, date):
@@ -974,6 +1111,31 @@ class Handler(BaseHTTPRequestHandler):
             if not account or len(month) != 7:
                 return self.send_json({"ok": False, "error": "需要有效 account_id 和 YYYY-MM 月份"}, 400)
             return self.send_json({"ok": True, "account_id": account["id"], "month": month, "targets": target_rows(account["id"], month)})
+        if parsed.path == "/api/baby-products":
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            if not account:
+                return self.send_json({"ok": False, "error": "请先选择有效店铺"}, 400)
+            try:
+                products = list_baby_products(account['id'], query.get('keyword', [''])[0])
+                return self.send_json({"ok": True, "account_id": account['id'], "products": products})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/baby-board":
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            product_id = query.get('product_id', [''])[0]
+            start_date = query.get('start_date', [''])[0]
+            end_date = query.get('end_date', [start_date])[0]
+            if not account or not product_id or not start_date or not end_date:
+                return self.send_json({"ok": False, "error": "需要有效店铺、商品 ID 和日期范围"}, 400)
+            try:
+                output = baby_board(account['id'], product_id, start_date, end_date)
+                return self.send_json({"ok": True, "account_id": account['id'], "store": account['store_name'], "data": output})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/dashboard":
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)

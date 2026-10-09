@@ -60,8 +60,14 @@
 - 新增查询接口：`/api/unified/products`、`plans`、`plan-totals`、`metrics`、`batches`、`linked`；只读取有效批次，冲突批次保留但不参与查询。
 - 当前仍未实现用户确认后的批次替换流程；冲突文件先保留为非有效批次。
 
+## 宝贝看板（任务 01）
+
+- 新增 `/api/baby-products` 商品搜索和 `/api/baby-board` 商品经营/推广联合查询，仍只读取统一底座有效批次。
+- `daily_product_facts` 增量添加 `page_views`、`cart_people`、`cart_items` 可空字段；不重建数据库，旧批次保持可读。
+- 前端新增宝贝看板导航页，包含商品搜索、日/自然周/自然月/自定义日期、经营指标、推广指标、趋势和计划明细；数据组仅保留禁用接入位。
+
 ## Git 现场
 
-- 分支：`main`，当前 `HEAD` 为 `57c1e40`，与 `origin/main` 对齐。
-- 当前未提交改动：`app.py`、`static/index.html`；内容涉及转化率、首页店铺选择/新建、上传删除及新无界商品报表解析/展示。
-- 本次文档任务不得替用户提交这些业务代码，也不得推送或部署。
+- 分支：`main`；任务 00 统一数据底座已在本地提交，任务 01 收尾时用户明确授权创建本地提交。
+- 任务 01 修改范围：`app.py`、`static/index.html`、`tests/test_unified_data.py`、`HANDOFF.md`、`PROJECT_CONTEXT.md`、`DATA_RULES.md`。
+- 本任务不允许推送或部署；数据库、原始报表和临时验收数据不得纳入 Git。
