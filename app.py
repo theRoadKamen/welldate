@@ -47,6 +47,41 @@ TARGET_DEFINITIONS = {
     "fee_ratio": {"label": "推广费比", "unit": "percent", "compare_type": "lower", "default_value": None, "mtd_kind": "ratio"},
 }
 
+# One registry drives labels, units and board availability. Values are read
+# from existing board responses; this module never recalculates business data.
+METRIC_REGISTRY = {
+    "gmv": {"label": "支付金额", "unit": "amount", "formula": "SUM(支付金额)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "gsv": {"label": "成交金额（GSV）", "unit": "amount", "formula": "支付金额-成功退款金额", "aggregation": "derived", "boards": ["store", "baby"]},
+    "successful_refund_amount": {"label": "成功退款金额", "unit": "amount", "formula": "SUM(成功退款金额)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "refund_rate": {"label": "退款率", "unit": "percent", "formula": "成功退款金额/支付金额", "aggregation": "ratio", "boards": ["store", "baby"]},
+    "paid_units": {"label": "支付件数", "unit": "number", "formula": "SUM(支付件数)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "average_order_value": {"label": "客单价", "unit": "amount", "formula": "支付金额/支付件数", "aggregation": "ratio", "boards": ["store", "baby"]},
+    "paid_buyers": {"label": "支付买家数", "unit": "number", "formula": "SUM(成交买家数)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "conversion_rate": {"label": "支付转化率", "unit": "percent", "formula": "成交买家数/商品访客数", "aggregation": "ratio", "boards": ["store", "baby"]},
+    "visitors": {"label": "商品访客数", "unit": "number", "formula": "SUM(商品访客数)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "page_views": {"label": "商品浏览量", "unit": "number", "formula": "SUM(商品浏览量)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "cart_people": {"label": "商品加购人数", "unit": "number", "formula": "SUM(商品加购人数)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "cart_items": {"label": "商品加购件数", "unit": "number", "formula": "SUM(商品加购件数)", "aggregation": "sum", "boards": ["store", "baby"]},
+    "impressions": {"label": "展现量", "unit": "number", "formula": "SUM(展现量)", "aggregation": "sum", "boards": ["baby", "plan"]},
+    "clicks": {"label": "点击量", "unit": "number", "formula": "SUM(点击量)", "aggregation": "sum", "boards": ["baby", "plan"]},
+    "click_rate": {"label": "点击率", "unit": "percent", "formula": "点击量/展现量", "aggregation": "ratio", "boards": ["baby", "plan"]},
+    "spend": {"label": "推广花费", "unit": "amount", "formula": "SUM(花费)", "aggregation": "sum", "boards": ["store", "baby", "plan"]},
+    "attributed_deal_amount": {"label": "推广归因成交金额", "unit": "amount", "formula": "SUM(总成交金额)", "aggregation": "sum", "boards": ["baby", "plan"]},
+    "total_deal_amount": {"label": "推广成交金额", "unit": "amount", "formula": "SUM(总成交金额)", "aggregation": "sum", "boards": ["store"]},
+    "total_deal_orders": {"label": "推广成交笔数", "unit": "number", "formula": "SUM(总成交笔数)", "aggregation": "sum", "boards": ["baby", "plan"]},
+    "ppc": {"label": "PPC", "unit": "amount", "formula": "花费/点击量", "aggregation": "ratio", "boards": ["baby", "plan"]},
+    "roi": {"label": "ROI", "unit": "ratio", "formula": "总成交金额/花费", "aggregation": "ratio", "boards": ["baby", "plan"]},
+    "fee_ratio": {"label": "推广费比", "unit": "percent", "formula": "花费/支付金额", "aggregation": "ratio", "boards": ["store", "baby"]},
+    "total_cart_count": {"label": "总购物车数", "unit": "number", "formula": "SUM(总购物车数)", "aggregation": "sum", "boards": ["baby", "plan"]},
+}
+DATA_GROUP_PRESETS = {
+    "成交数据组": ["gmv", "gsv", "successful_refund_amount", "refund_rate", "paid_units", "average_order_value", "conversion_rate"],
+    "流量数据组": ["visitors", "page_views", "impressions", "clicks", "click_rate"],
+    "互动数据组": ["cart_people", "cart_items", "total_cart_count"],
+    "推广数据组": ["spend", "attributed_deal_amount", "total_deal_amount", "total_deal_orders", "ppc", "roi", "fee_ratio"],
+}
+BOARD_CODES = {"store", "baby", "series", "plan"}
+
 
 def source_label(source_type):
     return "生意参谋商品日报" if source_type == "shengyicanmou" else "无界商品报表"
@@ -110,6 +145,32 @@ def init_databases():
             updated_at TEXT NOT NULL,
             UNIQUE(account_id, month, metric_id)
         )""")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS data_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                group_type TEXT NOT NULL DEFAULT 'custom',
+                preset_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                UNIQUE(account_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS data_group_items (
+                group_id INTEGER NOT NULL,
+                metric_code TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(group_id, metric_code)
+            );
+            CREATE TABLE IF NOT EXISTS data_group_preferences (
+                account_id INTEGER NOT NULL,
+                board_code TEXT NOT NULL,
+                group_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, board_code)
+            );
+        """)
     with sqlite3.connect(UNIFIED_DB) as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS source_files (
@@ -234,9 +295,15 @@ def init_databases():
                 label TEXT NOT NULL,
                 formula TEXT NOT NULL,
                 aggregation TEXT NOT NULL,
-                version TEXT NOT NULL
+                version TEXT NOT NULL,
+                unit TEXT NOT NULL DEFAULT 'number',
+                boards_json TEXT NOT NULL DEFAULT '[]'
             );
         """)
+        metric_definition_columns = {row[1] for row in conn.execute("PRAGMA table_info(metric_definitions)")}
+        for name, definition in [("unit", "TEXT NOT NULL DEFAULT 'number'"), ("boards_json", "TEXT NOT NULL DEFAULT '[]'")]:
+            if name not in metric_definition_columns:
+                conn.execute(f"ALTER TABLE metric_definitions ADD COLUMN {name} {definition}")
         columns = {r[1] for r in conn.execute('PRAGMA table_info(import_batches)')}
         for name, definition in [('attribution_window', "TEXT NOT NULL DEFAULT 'unknown'"), ('headers_json', "TEXT NOT NULL DEFAULT '[]'")]:
             if name not in columns:
@@ -245,13 +312,10 @@ def init_databases():
         for name in ('page_views', 'cart_people', 'cart_items'):
             if name not in product_fact_columns:
                 conn.execute(f'ALTER TABLE daily_product_facts ADD COLUMN {name} REAL')
-        metric_rows = [
-            ("gmv", "GMV", "SUM(支付金额)", "sum", "v2.0"),
-            ("refund_rate", "退款率", "SUM(成功退款金额)/SUM(支付金额)", "ratio", "v2.0"),
-            ("roi", "投入产出比", "SUM(总成交金额)/SUM(花费)", "ratio", "v2.0"),
-            ("conversion_rate", "转化率", "SUM(成交买家数)/SUM(商品访客数)", "ratio", "v2.0"),
-        ]
-        conn.executemany("INSERT OR IGNORE INTO metric_definitions(metric_code,label,formula,aggregation,version) VALUES (?,?,?,?,?)", metric_rows)
+        metric_rows = [(code, item["label"], item["formula"], item["aggregation"], "v2.1", item["unit"], json.dumps(item["boards"], ensure_ascii=False)) for code, item in METRIC_REGISTRY.items()]
+        conn.executemany("""INSERT INTO metric_definitions(metric_code,label,formula,aggregation,version,unit,boards_json)
+            VALUES (?,?,?,?,?,?,?) ON CONFLICT(metric_code) DO UPDATE SET label=excluded.label, formula=excluded.formula,
+            aggregation=excluded.aggregation, version=excluded.version, unit=excluded.unit, boards_json=excluded.boards_json""", metric_rows)
     for path in DB_PATHS.values():
         with sqlite3.connect(path) as conn:
             conn.execute(
@@ -431,6 +495,8 @@ def persist_unified_import(source_type, account_id, store_name, batch_id, filena
                     error_count += 1
                     conn.execute("INSERT INTO import_errors(batch_id,row_number,field_name,raw_value,error_type,message,created_at) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, field, str(row.get(field) or ""), "invalid_number", f"{field} 不是有效数字", imported_at))
                     return None
+
+
             if source_type == "shengyicanmou":
                 entity_type, entity_id = "product", str(row.get("商品ID") or "").strip() or None
                 conn.execute("INSERT INTO raw_rows(batch_id,row_number,business_date,entity_type,entity_id,raw_payload,row_hash) VALUES (?,?,?,?,?,?,?)", (batch_db_id, row_number, date, entity_type, entity_id, json.dumps(row, ensure_ascii=False), hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()))
@@ -462,6 +528,92 @@ def persist_unified_import(source_type, account_id, store_name, batch_id, filena
                 conn.execute(f"UPDATE {table} SET quality_status='invalid' WHERE batch_id=?", (batch_db_id,))
             status = "partial"
     return {"status": status, "batch_db_id": batch_db_id}
+
+
+def _ensure_system_groups(account_id):
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        for name, metrics in DATA_GROUP_PRESETS.items():
+            row = conn.execute("SELECT id FROM data_groups WHERE account_id=? AND preset_code=? AND deleted_at IS NULL", (account_id, name)).fetchone()
+            if row:
+                continue
+            cur = conn.execute("INSERT INTO data_groups(account_id,name,group_type,preset_code,created_at,updated_at) VALUES (?,?,?,?,?,?)", (account_id, name, "system", name, now, now))
+            conn.executemany("INSERT INTO data_group_items(group_id,metric_code,position) VALUES (?,?,?)", [(cur.lastrowid, code, index) for index, code in enumerate(metrics)])
+
+
+def _group_row(conn, row, board_code):
+    group_id, account_id, name, group_type, preset_code, created_at, updated_at = row
+    items = []
+    for metric_code, position in conn.execute("SELECT metric_code, position FROM data_group_items WHERE group_id=? ORDER BY position, metric_code", (group_id,)):
+        definition = METRIC_REGISTRY.get(metric_code)
+        if definition:
+            items.append({"metric_code": metric_code, "position": position, **definition, "available": board_code in definition["boards"]})
+    return {"id": group_id, "account_id": account_id, "name": name, "group_type": group_type, "preset_code": preset_code, "created_at": created_at, "updated_at": updated_at, "items": items}
+
+
+def data_group_payload(account_id, board_code):
+    if board_code not in BOARD_CODES:
+        raise ValueError("未知看板")
+    _ensure_system_groups(account_id)
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        rows = conn.execute("SELECT id, account_id, name, group_type, preset_code, created_at, updated_at FROM data_groups WHERE account_id=? AND deleted_at IS NULL ORDER BY group_type DESC, name", (account_id,)).fetchall()
+        groups = [_group_row(conn, row, board_code) for row in rows]
+        selected = conn.execute("SELECT group_id FROM data_group_preferences WHERE account_id=? AND board_code=?", (account_id, board_code)).fetchone()
+        selected_id = selected[0] if selected and any(group["id"] == selected[0] for group in groups) else next((group["id"] for group in groups if group["group_type"] == "system"), None)
+    return {"board": board_code, "groups": groups, "selected_group_id": selected_id, "metrics": [{"metric_code": code, **item, "available": board_code in item["boards"]} for code, item in METRIC_REGISTRY.items()]}
+
+
+def save_data_group(account_id, payload, user_id):
+    board_code = payload.get("board", "")
+    if board_code and board_code not in BOARD_CODES:
+        raise ValueError("未知看板")
+    name = (payload.get("name") or "").strip()
+    if not name or len(name) > 40:
+        raise ValueError("数据组名称不能为空且不超过40个字")
+    metrics = payload.get("metric_codes") or []
+    if not isinstance(metrics, list) or not metrics or len(set(metrics)) != len(metrics) or any(code not in METRIC_REGISTRY for code in metrics):
+        raise ValueError("指标选择无效")
+    group_id = payload.get("group_id")
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        if group_id:
+            row = conn.execute("SELECT id, group_type FROM data_groups WHERE id=? AND account_id=? AND deleted_at IS NULL", (group_id, account_id)).fetchone()
+            if not row or row[1] != "custom":
+                raise ValueError("只能编辑当前账号的自定义数据组")
+            conn.execute("UPDATE data_groups SET name=?, updated_at=? WHERE id=?", (name, now, group_id))
+            conn.execute("DELETE FROM data_group_items WHERE group_id=?", (group_id,))
+        else:
+            cur = conn.execute("INSERT INTO data_groups(account_id,name,group_type,created_at,updated_at) VALUES (?,?,?,?,?)", (account_id, name, "custom", now, now))
+            group_id = cur.lastrowid
+        conn.executemany("INSERT INTO data_group_items(group_id,metric_code,position) VALUES (?,?,?)", [(group_id, code, index) for index, code in enumerate(metrics)])
+        if board_code:
+            conn.execute("INSERT INTO data_group_preferences(account_id,board_code,group_id,updated_at) VALUES (?,?,?,?) ON CONFLICT(account_id,board_code) DO UPDATE SET group_id=excluded.group_id, updated_at=excluded.updated_at", (account_id, board_code, group_id, now))
+        row = conn.execute("SELECT id, account_id, name, group_type, preset_code, created_at, updated_at FROM data_groups WHERE id=?", (group_id,)).fetchone()
+        return _group_row(conn, row, board_code or "store")
+
+
+def select_data_group(account_id, board_code, group_id):
+    if board_code not in BOARD_CODES:
+        raise ValueError("未知看板")
+    _ensure_system_groups(account_id)
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        row = conn.execute("SELECT id FROM data_groups WHERE id=? AND account_id=? AND deleted_at IS NULL", (group_id, account_id)).fetchone()
+        if not row:
+            raise ValueError("数据组不存在")
+        conn.execute("INSERT INTO data_group_preferences(account_id,board_code,group_id,updated_at) VALUES (?,?,?,?) ON CONFLICT(account_id,board_code) DO UPDATE SET group_id=excluded.group_id, updated_at=excluded.updated_at", (account_id, board_code, group_id, datetime.now().isoformat(timespec="seconds")))
+    return data_group_payload(account_id, board_code)
+
+
+def delete_data_group(account_id, group_id):
+    with sqlite3.connect(ACCOUNT_DB) as conn:
+        row = conn.execute("SELECT group_type FROM data_groups WHERE id=? AND account_id=? AND deleted_at IS NULL", (group_id, account_id)).fetchone()
+        if not row or row[0] != "custom":
+            raise ValueError("只能删除当前账号的自定义数据组")
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute("UPDATE data_groups SET deleted_at=?, updated_at=? WHERE id=?", (now, now, group_id))
+        conn.execute("DELETE FROM data_group_items WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM data_group_preferences WHERE account_id=? AND group_id=?", (account_id, group_id))
+    return True
 
 
 def save_import(source_type, account_id, store_name, batch_id, filename, content, result, encoding=None):
@@ -1239,6 +1391,17 @@ class Handler(BaseHTTPRequestHandler):
             if not account or len(month) != 7:
                 return self.send_json({"ok": False, "error": "需要有效 account_id 和 YYYY-MM 月份"}, 400)
             return self.send_json({"ok": True, "account_id": account["id"], "month": month, "targets": target_rows(account["id"], month)})
+        if parsed.path == "/api/data-groups":
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            board = query.get("board", ["store"])[0]
+            if not account:
+                return self.send_json({"ok": False, "error": "请先选择有效店铺"}, 400)
+            try:
+                return self.send_json({"ok": True, "account_id": account["id"], "data": data_group_payload(account["id"], board)})
+            except ValueError as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/plan-board/options":
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)
@@ -1500,6 +1663,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "目标值必须是数字或留空"}, 400)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path in ("/api/data-groups", "/api/data-groups/select", "/api/data-groups/delete"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                account = account_by_id(payload.get("account_id"))
+                if not account:
+                    return self.send_json({"ok": False, "error": "请先选择有效店铺"}, 400)
+                if path.endswith("/select"):
+                    result = select_data_group(account["id"], payload.get("board", ""), int(payload.get("group_id")))
+                    return self.send_json({"ok": True, "account_id": account["id"], "data": result})
+                if path.endswith("/delete"):
+                    delete_data_group(account["id"], int(payload.get("group_id")))
+                    return self.send_json({"ok": True, "account_id": account["id"]})
+                result = save_data_group(account["id"], payload, user["id"])
+                return self.send_json({"ok": True, "account_id": account["id"], "group": result, "data": data_group_payload(account["id"], payload.get("board", "store"))})
+            except (TypeError, ValueError, sqlite3.IntegrityError) as exc:
+                message = "数据组名称已存在" if isinstance(exc, sqlite3.IntegrityError) else str(exc)
+                return self.send_json({"ok": False, "error": message}, 400)
         if path == "/api/imports/delete":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

@@ -2,6 +2,14 @@
 
 更新日期：2026-10-09（Asia/Shanghai）
 
+## 任务 03：公共数据组模块
+
+- 指标注册信息集中在 `app.py` 的 `METRIC_REGISTRY`，并同步写入统一库 `metric_definitions`；看板不得再维护重复指标字典。
+- 账号库新增 `data_groups`、`data_group_items`、`data_group_preferences`。系统组包括成交、流量、互动、推广四组；自定义组按账号保存，当前选择按账号和看板保存。
+- 公共接口为 `GET /api/data-groups`、`POST /api/data-groups`、`POST /api/data-groups/select`、`POST /api/data-groups/delete`。
+- 数据组只改变现有看板指标卡的选择与顺序，不计算业务数据。宝贝、计划和经营看板已接入；系列看板尚无页面和数据接口，暂不显示。
+- 计划看板对经营指标返回 `available=false`；宝贝看板对不存在的指标同样不显示替代口径。
+
 ## 技术栈与运行方式
 
 - 后端：`app.py`，Python 标准库 `http.server`、`sqlite3`、`csv`。

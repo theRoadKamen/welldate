@@ -258,6 +258,25 @@ class UnifiedDataTest(unittest.TestCase):
         self.assertIsNone(metrics['roi'])
         self.assertFalse(metrics['attribution_windows_compatible'])
 
+    def test_data_groups_are_account_scoped_and_board_aware(self):
+        account = self.app.create_account('group-account', 'group-store')
+        other = self.app.create_account('group-other', 'group-other-store')
+        baby = self.app.data_group_payload(account['id'], 'baby')
+        plan = self.app.data_group_payload(account['id'], 'plan')
+        self.assertEqual({g['name'] for g in baby['groups']}, {'成交数据组', '流量数据组', '互动数据组', '推广数据组'})
+        promotion = next(g for g in baby['groups'] if g['name'] == '推广数据组')
+        self.assertTrue(any(item['metric_code'] == 'spend' and item['available'] for item in promotion['items']))
+        self.assertFalse(any(item['metric_code'] == 'gmv' and item['available'] for item in next(g for g in plan['groups'] if g['name'] == '成交数据组')['items']))
+        custom = self.app.save_data_group(account['id'], {'board': 'baby', 'name': '我的核心组', 'metric_codes': ['roi', 'spend', 'clicks']}, 1)
+        self.assertEqual([item['metric_code'] for item in custom['items']], ['roi', 'spend', 'clicks'])
+        selected = self.app.select_data_group(account['id'], 'baby', custom['id'])
+        self.assertEqual(selected['selected_group_id'], custom['id'])
+        persisted = self.app.data_group_payload(account['id'], 'baby')
+        self.assertEqual(persisted['selected_group_id'], custom['id'])
+        self.assertNotIn('我的核心组', {g['name'] for g in self.app.data_group_payload(other['id'], 'baby')['groups']})
+        self.app.delete_data_group(account['id'], custom['id'])
+        self.assertNotEqual(self.app.data_group_payload(account['id'], 'baby')['selected_group_id'], custom['id'])
+
 
 if __name__ == '__main__':
     unittest.main()
