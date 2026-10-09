@@ -179,6 +179,85 @@ class UnifiedDataTest(unittest.TestCase):
         products = self.app.list_baby_products(account['id'], '多计划')
         self.assertEqual([item['product_id'] for item in products], ['1002'])
 
+    def test_plan_board_filters_multiday_totals_and_account_isolation(self):
+        account = self.app.create_account('plan-board-account', 'plan-board-store')
+        other = self.app.create_account('plan-board-other', 'plan-board-other-store')
+        headers = ['日期', '场景ID', '场景名字', '计划ID', '计划名字', '主体ID', '主体类型', '主体名称', '展现量', '点击量', '花费', '直接成交金额', '间接成交金额', '总成交金额', '直接成交笔数', '间接成交笔数', '总成交笔数', '成交人数', '总购物车数', '投入产出比']
+        daily_rows = {
+            '2026-10-07': [
+                ['2026-10-07', '371', '关键词推广', '81049746646', '秋季主推计划', '919688715573', '商品', '商品甲', '1000', '100', '20', '40', '0', '40', '2', '0', '2', '2', '3', '2'],
+                ['2026-10-07', '371', '关键词推广', '81049746646', '秋季主推计划', '1027168958052', '商品', '商品乙', '500', '50', '10', '15', '0', '15', '1', '0', '1', '1', '2', '1.5'],
+                ['2026-10-07', '436', '货品全站推广', '83570900419', '全站补量计划', '919688715573', '商品', '商品甲', '300', '30', '15', '30', '0', '30', '1', '0', '1', '1', '1', '2'],
+            ],
+            '2026-10-08': [
+                ['2026-10-08', '371', '关键词推广', '81049746646', '秋季主推计划', '919688715573', '商品', '商品甲', '1200', '120', '24', '48', '0', '48', '2', '0', '2', '2', '3', '2'],
+                ['2026-10-08', '371', '关键词推广', '81049746646', '秋季主推计划', '1027168958052', '商品', '商品乙', '600', '60', '12', '18', '0', '18', '1', '0', '1', '1', '2', '1.5'],
+                ['2026-10-08', '436', '货品全站推广', '83570900419', '全站补量计划', '919688715573', '商品', '商品甲', '400', '40', '20', '40', '0', '40', '1', '0', '1', '1', '1', '2'],
+            ],
+        }
+
+        def import_days(target_account, prefix):
+            for date, rows in daily_rows.items():
+                content = ('\n'.join([','.join(headers), *[','.join(row) for row in rows]])).encode('utf-8')
+                result = self.app.analyse_file(f'{prefix}-{date}.csv', [headers, *rows])
+                result['attribution_window'] = '7d'
+                self.app.save_import('wujie', target_account['id'], target_account['store_name'], f'{prefix}-{date}', f'{prefix}-{date}.csv', content, result, 'utf-8')
+
+        import_days(account, 'plan')
+        import_days(other, 'other-plan')
+        board = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08')
+        self.assertEqual(board['quality']['row_count'], 6)
+        self.assertEqual(board['summary']['impressions'], 4000.0)
+        self.assertEqual(board['summary']['clicks'], 400.0)
+        self.assertEqual(board['summary']['spend'], 101.0)
+        self.assertEqual(board['summary']['attributed_deal_amount'], 191.0)
+        self.assertEqual(board['summary']['ppc'], 0.25)
+        self.assertEqual(board['summary']['roi'], 1.89)
+        self.assertTrue(all(isinstance(row['product_id'], str) and isinstance(row['plan_id'], str) for row in board['rows']))
+
+        product = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08', product_id='919688715573')
+        scene = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08', scene_name='关键词推广')
+        day = self.app.plan_board(account['id'], '2026-10-07', '2026-10-07')
+        combined = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08', product_id='919688715573', scene_name='货品全站推广', plan_id='83570900419')
+        named = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08', plan_name='主推')
+        exact_named = self.app.plan_board(account['id'], '2026-10-07', '2026-10-08', plan_name='秋季主推计划', plan_name_match='exact')
+        self.assertEqual((product['quality']['row_count'], product['summary']['spend']), (4, 79.0))
+        self.assertEqual((scene['quality']['row_count'], scene['summary']['spend']), (4, 66.0))
+        self.assertEqual((day['quality']['row_count'], day['summary']['spend']), (3, 45.0))
+        self.assertEqual((combined['quality']['row_count'], combined['summary']['spend']), (2, 35.0))
+        self.assertEqual(named['quality']['row_count'], 4)
+        self.assertEqual(exact_named['quality']['row_count'], 4)
+
+        plan = next(item for item in board['plan_totals'] if item['plan_id'] == '81049746646')
+        self.assertEqual(plan['metrics']['spend'], 66.0)
+        self.assertEqual(plan['metrics']['attributed_deal_amount'], 121.0)
+        self.assertEqual(plan['metrics']['roi'], 1.83)
+        baby = self.app.baby_board(account['id'], '919688715573', '2026-10-07', '2026-10-08')
+        self.assertEqual(product['summary']['spend'], baby['promotion']['spend'])
+        self.assertEqual(product['summary']['clicks'], baby['promotion']['clicks'])
+        self.assertEqual(product['summary']['attributed_deal_amount'], baby['promotion']['attributed_deal_amount'])
+        self.assertEqual(product['summary']['roi'], baby['promotion']['roi'])
+
+        options = self.app.plan_board_options(account['id'], '2026-10-07', '2026-10-08')
+        self.assertEqual(options['scenes'], ['关键词推广', '货品全站推广'])
+        self.assertEqual(len(options['plans']), 2)
+        self.assertEqual(len(options['products']), 2)
+        other_board = self.app.plan_board(other['id'], '2026-10-07', '2026-10-08')
+        self.assertEqual(other_board['quality']['row_count'], 6)
+        self.assertEqual(board['quality']['row_count'], 6)
+
+    def test_plan_board_does_not_merge_unknown_attribution_windows(self):
+        rows = [
+            {'attribution_window': 'unknown', 'batch_id': 1, 'impressions': 100.0, 'clicks': 10.0, 'spend': 5.0, 'total_deal_amount': 8.0, 'total_deal_orders': 1.0},
+            {'attribution_window': 'unknown', 'batch_id': 2, 'impressions': 200.0, 'clicks': 20.0, 'spend': 10.0, 'total_deal_amount': 16.0, 'total_deal_orders': 2.0},
+        ]
+        metrics = self.app.promotion_metrics(rows)
+        self.assertEqual(metrics['spend'], 15.0)
+        self.assertEqual(metrics['clicks'], 30.0)
+        self.assertIsNone(metrics['attributed_deal_amount'])
+        self.assertIsNone(metrics['roi'])
+        self.assertFalse(metrics['attribution_windows_compatible'])
+
 
 if __name__ == '__main__':
     unittest.main()

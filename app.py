@@ -561,6 +561,140 @@ def query_plan_totals(rows):
     return result
 
 
+def total_metric(rows, field):
+    values = [row.get(field) for row in rows]
+    if not values or any(value is None for value in values):
+        return None
+    return round(sum(values), 8)
+
+
+def metric_ratio(numerator, denominator, precision=8):
+    return round(numerator / denominator, precision) if numerator is not None and denominator else None
+
+
+def promotion_metrics(rows):
+    windows = {row['attribution_window'] for row in rows}
+    compatible = bool(rows) and len(windows) == 1 and ('unknown' not in windows or len({row['batch_id'] for row in rows}) == 1)
+    impressions = total_metric(rows, 'impressions')
+    clicks = total_metric(rows, 'clicks')
+    spend = total_metric(rows, 'spend')
+    attributed = total_metric(rows, 'total_deal_amount') if compatible else None
+    orders = total_metric(rows, 'total_deal_orders') if compatible else None
+    return {
+        'impressions': impressions,
+        'clicks': clicks,
+        'spend': spend,
+        'click_rate': metric_ratio(clicks, impressions),
+        'ppc': metric_ratio(spend, clicks, 2),
+        'attributed_deal_amount': attributed,
+        'total_deal_orders': orders,
+        'roi': metric_ratio(attributed, spend, 2),
+        'attribution_windows_compatible': compatible,
+        'attribution_windows': sorted(windows),
+    }
+
+
+def plan_board_options(account_id, start_date, end_date):
+    query_unified(account_id, start_date, end_date)
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        scope = """FROM daily_plan_product_facts f
+                    JOIN import_batches b ON b.id=f.batch_id
+                    LEFT JOIN products p ON p.account_id=f.account_id AND p.product_id=f.product_id
+                   WHERE f.account_id=? AND f.business_date BETWEEN ? AND ?
+                     AND b.status='succeeded' AND b.is_effective=1"""
+        values = (account_id, start_date, end_date)
+        scenes = [row['scene_name'] for row in conn.execute(
+            f"SELECT DISTINCT f.scene_name {scope} AND COALESCE(f.scene_name,'')<>'' ORDER BY f.scene_name", values
+        ).fetchall()]
+        plans = [dict(row) for row in conn.execute(
+            f"SELECT DISTINCT f.plan_id, f.plan_name {scope} ORDER BY f.plan_name, f.plan_id LIMIT 500", values
+        ).fetchall()]
+        products = [dict(row) for row in conn.execute(
+            f"SELECT DISTINCT f.product_id, p.product_name {scope} ORDER BY p.product_name, f.product_id LIMIT 500", values
+        ).fetchall()]
+    return {'scenes': scenes, 'plans': plans, 'products': products}
+
+
+def plan_board(account_id, start_date, end_date, product_id='', scene_name='', plan_id='', plan_name='', plan_name_match='contains'):
+    start = datetime.strptime(start_date, '%Y-%m-%d').date()
+    end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    if end < start or (end - start).days >= 366:
+        raise ValueError('日期范围无效，最多 366 天')
+    plan_name_match = plan_name_match if plan_name_match in ('contains', 'exact') else 'contains'
+    conditions = ["f.account_id=?", "f.business_date BETWEEN ? AND ?", "b.status='succeeded'", "b.is_effective=1"]
+    values = [account_id, start_date, end_date]
+    for field, value in (('product_id', product_id), ('scene_name', scene_name), ('plan_id', plan_id)):
+        value = str(value or '').strip()
+        if value:
+            conditions.append(f'f.{field}=?')
+            values.append(value)
+    plan_name = str(plan_name or '').strip()
+    if plan_name:
+        conditions.append("COALESCE(f.plan_name,'')=?" if plan_name_match == 'exact' else "COALESCE(f.plan_name,'') LIKE ?")
+        values.append(plan_name if plan_name_match == 'exact' else f'%{plan_name}%')
+    sql = f"""SELECT f.*, p.product_name, b.attribution_window, b.calculation_version, b.schema_version
+                FROM daily_plan_product_facts f
+                JOIN import_batches b ON b.id=f.batch_id
+                LEFT JOIN products p ON p.account_id=f.account_id AND p.product_id=f.product_id
+               WHERE {' AND '.join(conditions)}
+               ORDER BY f.business_date, f.scene_name, f.plan_name, f.plan_id, f.product_id"""
+    with sqlite3.connect(UNIFIED_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute(sql, values).fetchall()]
+
+    summary = promotion_metrics(rows)
+    trend = []
+    for offset in range((end - start).days + 1):
+        date = (start + timedelta(days=offset)).isoformat()
+        daily_rows = [row for row in rows if row['business_date'] == date]
+        trend.append({'date': date, 'metrics': promotion_metrics(daily_rows) if daily_rows else None})
+
+    groups = {}
+    for row in rows:
+        groups.setdefault((row['scene_id'], row['plan_id']), []).append(row)
+    plan_totals = []
+    for group in groups.values():
+        metrics = promotion_metrics(group)
+        plan_totals.append({
+            'scene_id': group[0]['scene_id'], 'scene_name': group[0]['scene_name'],
+            'plan_id': group[0]['plan_id'], 'plan_name': group[0]['plan_name'],
+            'start_date': min(row['business_date'] for row in group),
+            'end_date': max(row['business_date'] for row in group),
+            'product_count': len({row['product_id'] for row in group}),
+            'metrics': metrics,
+        })
+    plan_totals.sort(key=lambda row: (-(row['metrics']['spend'] or 0), row['plan_id']))
+
+    detail_rows = []
+    for row in rows:
+        metrics = promotion_metrics([row])
+        detail_rows.append({
+            'date': row['business_date'], 'product_id': row['product_id'],
+            'product_name': row['product_name'], 'scene_id': row['scene_id'],
+            'scene_name': row['scene_name'], 'plan_id': row['plan_id'],
+            'plan_name': row['plan_name'], 'impressions': row['impressions'],
+            'clicks': row['clicks'], 'spend': row['spend'], 'click_rate': metrics['click_rate'],
+            'ppc': metrics['ppc'], 'attributed_deal_amount': row['total_deal_amount'],
+            'total_deal_orders': row['total_deal_orders'], 'roi': metrics['roi'],
+        })
+    return {
+        'start_date': start_date, 'end_date': end_date, 'filters': {
+            'product_id': str(product_id or '').strip(), 'scene_name': str(scene_name or '').strip(),
+            'plan_id': str(plan_id or '').strip(), 'plan_name': plan_name,
+            'plan_name_match': plan_name_match,
+        },
+        'summary': summary, 'trend': trend, 'plan_totals': plan_totals, 'rows': detail_rows,
+        'quality': {
+            'has_data': bool(rows), 'row_count': len(rows),
+            'attribution_windows_compatible': summary['attribution_windows_compatible'],
+            'attribution_windows': summary['attribution_windows'],
+            'empty_message': None if rows else '当前筛选条件下没有有效无界商品报表数据',
+        },
+        'source_semantics': {'attributed_deal_amount': '无界总成交金额，属于推广归因成交，不等同于生意参谋实际支付金额'},
+    }
+
+
 def list_baby_products(account_id, keyword="", limit=100):
     keyword = str(keyword or "").strip()
     like = f"%{keyword}%"
@@ -619,18 +753,12 @@ def baby_board(account_id, product_id, start_date, end_date):
         'conversion_rate': ratio(paid_buyers, visitors), 'refund_rate': ratio(refunds, gmv),
     }
 
-    windows = {row['attribution_window'] for row in ads}
-    attribution_compatible = len(windows) == 1 and ('unknown' not in windows or len({row['batch_id'] for row in ads}) == 1)
-    impressions = total(ads, 'impressions')
-    clicks = total(ads, 'clicks')
-    spend = total(ads, 'spend')
-    attributed = total(ads, 'total_deal_amount') if attribution_compatible else None
-    promotion = None if not ads else {
-        'impressions': impressions, 'clicks': clicks, 'spend': spend,
-        'click_rate': ratio(clicks, impressions), 'ppc': ratio(spend, clicks, 2),
-        'attributed_deal_amount': attributed, 'roi': ratio(attributed, spend, 2),
-        'total_deal_orders': total(ads, 'total_deal_orders'),
-    }
+    promotion_summary = promotion_metrics(ads)
+    windows = set(promotion_summary['attribution_windows'])
+    attribution_compatible = promotion_summary['attribution_windows_compatible']
+    promotion = None if not ads else {key: promotion_summary[key] for key in (
+        'impressions', 'clicks', 'spend', 'click_rate', 'ppc', 'attributed_deal_amount', 'roi', 'total_deal_orders'
+    )}
 
     start = datetime.strptime(start_date, '%Y-%m-%d').date()
     end = datetime.strptime(end_date, '%Y-%m-%d').date()
@@ -1111,6 +1239,37 @@ class Handler(BaseHTTPRequestHandler):
             if not account or len(month) != 7:
                 return self.send_json({"ok": False, "error": "需要有效 account_id 和 YYYY-MM 月份"}, 400)
             return self.send_json({"ok": True, "account_id": account["id"], "month": month, "targets": target_rows(account["id"], month)})
+        if parsed.path == "/api/plan-board/options":
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            start_date = query.get('start_date', [''])[0]
+            end_date = query.get('end_date', [start_date])[0]
+            if not account or not start_date or not end_date:
+                return self.send_json({"ok": False, "error": "需要有效店铺和日期范围"}, 400)
+            try:
+                output = plan_board_options(account['id'], start_date, end_date)
+                return self.send_json({"ok": True, "account_id": account['id'], "store": account['store_name'], "data": output})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if parsed.path == "/api/plan-board":
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query)
+            account = account_by_id(query.get("account_id", [""])[0]) if query.get("account_id", [""])[0] else None
+            start_date = query.get('start_date', [''])[0]
+            end_date = query.get('end_date', [start_date])[0]
+            if not account or not start_date or not end_date:
+                return self.send_json({"ok": False, "error": "需要有效店铺和日期范围"}, 400)
+            try:
+                output = plan_board(
+                    account['id'], start_date, end_date,
+                    query.get('product_id', [''])[0], query.get('scene_name', [''])[0],
+                    query.get('plan_id', [''])[0], query.get('plan_name', [''])[0],
+                    query.get('plan_name_match', ['contains'])[0],
+                )
+                return self.send_json({"ok": True, "account_id": account['id'], "store": account['store_name'], "data": output})
+            except (ValueError, TypeError) as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if parsed.path == "/api/baby-products":
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)
