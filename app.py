@@ -49,6 +49,45 @@ def source_label(source_type):
     return "生意参谋商品日报" if source_type == "shengyicanmou" else "无界计划报表"
 
 
+def migrate_import_uniqueness(conn):
+    """Scope duplicate-file detection to an account instead of the whole database."""
+    unique_indexes = conn.execute("PRAGMA index_list(imports)").fetchall()
+    for _, name, is_unique, *_ in unique_indexes:
+        if not is_unique:
+            continue
+        columns = [row[2] for row in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+        if columns != ["file_sha256"]:
+            continue
+        conn.execute("ALTER TABLE imports RENAME TO imports_legacy")
+        conn.execute(
+            """CREATE TABLE imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                store_name TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                business_date TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_sha256 TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                result_json TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                account_id INTEGER,
+                UNIQUE(account_id, file_sha256)
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO imports
+                (id, batch_id, store_name, source_type, business_date, original_filename,
+                 file_path, file_sha256, row_count, result_json, imported_at, account_id)
+               SELECT id, batch_id, store_name, source_type, business_date, original_filename,
+                      file_path, file_sha256, row_count, result_json, imported_at, account_id
+                 FROM imports_legacy"""
+        )
+        conn.execute("DROP TABLE imports_legacy")
+        break
+
+
 def init_databases():
     DATA_ROOT.mkdir(exist_ok=True)
     RAW_ROOT.mkdir(exist_ok=True)
@@ -87,6 +126,7 @@ def init_databases():
             columns = {row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()}
             if "account_id" not in columns:
                 conn.execute("ALTER TABLE imports ADD COLUMN account_id INTEGER")
+            migrate_import_uniqueness(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_store_date ON imports(store_name, business_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_imports_account_date ON imports(account_id, business_date)")
     with sqlite3.connect(ACCOUNT_DB) as accounts:
@@ -149,10 +189,10 @@ def aggregate_results(results):
         return sum(float((f.get("metrics") or {}).get(key) or 0) for f in items)
     gmv = total(shop, "gmv")
     refunds = total(shop, "successful_refund_amount")
-    units = total(shop, "paid_units")
+    units = float(total(shop, "paid_units"))
     spend = total(ads, "spend")
     deals = total(ads, "total_deal_amount")
-    clicks = total(ads, "clicks")
+    clicks = float(total(ads, "clicks"))
     return {
         "gmv": round(gmv, 2), "gsv": round(gmv - refunds, 2), "successful_refund_amount": round(refunds, 2),
         "paid_units": int(units) if units.is_integer() else units, "spend": round(spend, 2),
@@ -245,6 +285,35 @@ def upload_records(source_type, account_id):
         {"batch_id": r[0], "date": r[1], "filename": r[2], "row_count": r[3], "sha256": r[4], "imported_at": r[5]}
         for r in rows
     ]
+
+
+def delete_import(source_type, account_id, file_sha256):
+    """Delete one account-owned import and remove its raw file when unreferenced."""
+    if source_type not in DB_PATHS or not file_sha256:
+        raise ValueError("来源或文件指纹无效")
+    db_path = DB_PATHS[source_type]
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT file_path FROM imports WHERE account_id = ? AND file_sha256 = ?",
+            (account_id, file_sha256),
+        ).fetchone()
+        if not row:
+            return False
+        file_path = row[0]
+        conn.execute(
+            "DELETE FROM imports WHERE account_id = ? AND file_sha256 = ?",
+            (account_id, file_sha256),
+        )
+        still_used = conn.execute(
+            "SELECT 1 FROM imports WHERE file_path = ? LIMIT 1",
+            (file_path,),
+        ).fetchone()
+    if not still_used:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
 
 
 init_databases()
@@ -675,6 +744,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "目标值必须是数字或留空"}, 400)
             except Exception as exc:
                 return self.send_json({"ok": False, "error": str(exc)}, 400)
+        if path == "/api/imports/delete":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                account = account_by_id(payload.get("account_id"))
+                source_type = payload.get("source_type")
+                file_sha256 = (payload.get("file_sha256") or "").strip()
+                if not account or source_type not in DB_PATHS or len(file_sha256) != 64:
+                    return self.send_json({"ok": False, "error": "账号、来源或文件指纹无效"}, 400)
+                deleted = delete_import(source_type, account["id"], file_sha256)
+                if not deleted:
+                    return self.send_json({"ok": False, "error": "记录不存在或已删除"}, 404)
+                return self.send_json({"ok": True, "account_id": account["id"], "source_type": source_type, "file_sha256": file_sha256})
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": str(exc)}, 400)
         if path.startswith("/api/users/") and path.endswith("/status"):
             if user["role"] != "admin":
                 return self.send_json({"ok": False, "error": "仅管理员可停用登录用户"}, 403)
@@ -750,6 +834,7 @@ class Handler(BaseHTTPRequestHandler):
                     saved = save_import(source_type, account_id, store_name, batch_id, upload.name, content, result)
                     result["stored"] = not saved["duplicate"]
                     result["duplicate"] = saved["duplicate"]
+                    result["sha256"] = saved["sha256"]
                     results.append(result)
             self.send_json({"ok": True, "batch_id": batch_id, "account_id": account_id, "account_name": account["account_name"], "store": store_name, "source_type": source_type, "files": results})
         except Exception as exc:
