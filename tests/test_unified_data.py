@@ -388,6 +388,19 @@ class UnifiedDataTest(unittest.TestCase):
         self.assertTrue(all(len(state['groups']) == 4 for state in states))
         self.assertEqual({tuple(group['id'] for group in state['groups']) for state in states}.__len__(), 1)
 
+    def test_store_dashboard_trend_keeps_source_and_people_scope(self):
+        files = [
+            {'date': '2026-10-06', 'source': '生意参谋商品日报', 'metrics': {'gmv': 100, 'successful_refund_amount': 5, 'visitors': 20, 'paid_buyers': 2, 'paid_units': 2}, 'row_count': 1},
+            {'date': '2026-10-06', 'source': '无界商品报表', 'metrics': {'spend': 10, 'total_deal_amount': 25, 'clicks': 5, 'impressions': 100}, 'row_count': 1},
+            {'date': '2026-10-07', 'source': '生意参谋商品日报', 'metrics': {'gmv': 80, 'successful_refund_amount': 0, 'visitors': 10, 'paid_buyers': 1, 'paid_units': 1}, 'row_count': 1},
+        ]
+        trend = self.app.dashboard_trend(files)
+        self.assertEqual([row['date'] for row in trend], ['2026-10-06', '2026-10-07'])
+        self.assertEqual(trend[0]['metrics']['gmv'], 100)
+        self.assertEqual(trend[0]['metrics']['attributed_deal_amount'], 25)
+        self.assertEqual(trend[0]['metrics']['spend'], 10)
+        self.assertEqual(trend[1]['metrics']['paid_buyers'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

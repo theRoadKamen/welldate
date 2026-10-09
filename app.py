@@ -1169,6 +1169,29 @@ def stored_results_range(source_type, account_id, start_date, end_date):
     return [json.loads(row[0]) for row in rows]
 
 
+def dashboard_trend(files):
+    """Build daily shop trend from the same file-level facts as the dashboard."""
+    by_date = {}
+    for item in files:
+        date = item.get("date")
+        if date:
+            by_date.setdefault(date, []).append(item)
+    trend = []
+    for date in sorted(by_date):
+        metrics = aggregate_results(by_date[date])
+        trend.append({
+            "date": date,
+            "metrics": {
+                "gmv": metrics.get("gmv"),
+                "spend": metrics.get("spend"),
+                "attributed_deal_amount": metrics.get("total_deal_amount"),
+                "visitors": metrics.get("visitors"),
+                "paid_buyers": metrics.get("paid_buyers"),
+            },
+        })
+    return trend
+
+
 def upload_records(source_type, account_id):
     db_path = DB_PATHS[source_type]
     with sqlite3.connect(db_path) as conn:
@@ -1679,7 +1702,28 @@ class Handler(BaseHTTPRequestHandler):
             complete_days = len(available_dates)
             mtd["complete_days"] = complete_days
             mtd["missing_days_possible"] = max(0, end.day - complete_days)
-            return self.send_json({"ok": True, "account_id": account["id"], "account_name": account["account_name"], "store": account["store_name"], "start_date": start_date, "end_date": end_date, "files": files, "mtd": {"month": end.strftime("%Y-%m"), "start_date": month_start, "end_date": end_date, "metrics": mtd, "targets": list(target_map.values())}})
+            expected_dates = {(start + __import__("datetime").timedelta(days=i)).isoformat() for i in range((end - start).days + 1)}
+            actual_dates = {f.get("date") for f in files if f.get("date")}
+            return self.send_json({
+                "ok": True,
+                "account_id": account["id"],
+                "account_name": account["account_name"],
+                "store": account["store_name"],
+                "start_date": start_date,
+                "end_date": end_date,
+                "period": query.get("period", ["custom"])[0],
+                "files": files,
+                "trend": dashboard_trend(files),
+                "quality": {
+                    "people_scope": "daily_sum_not_period_deduplicated",
+                    "people_note": "访客数、支付买家数按已读取统计日累计，非店铺周期去重",
+                    "business_source": "生意参谋商品日报文件汇总，非官方跨商品去重接口",
+                    "promotion_source": "无界商品/计划报表汇总，归因成交非实际支付",
+                    "missing_dates": sorted(expected_dates - actual_dates),
+                },
+                "source_semantics": {"gmv": "生意参谋实际支付", "attributed_deal_amount": "无界归因成交"},
+                "mtd": {"month": end.strftime("%Y-%m"), "start_date": month_start, "end_date": end_date, "metrics": mtd, "targets": list(target_map.values())},
+            })
         if parsed.path.startswith('/api/unified/'):
             from urllib.parse import parse_qs
             query = parse_qs(parsed.query)
